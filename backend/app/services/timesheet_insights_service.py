@@ -11,6 +11,11 @@ SUSTAINED_OVERTIME_MIN_DAYS = 4
 EFFORT_SPIKE_RATIO_THRESHOLD = 1.5
 EFFORT_SPIKE_MIN_BASELINE_WEEKS = 3
 
+# A "real" company-wide reporting day must have at least this fraction of the
+# dataset's own typical dense-day headcount logging time -- see
+# _latest_timesheet_date's docstring for why this exists.
+MIN_DAILY_COVERAGE_RATIO = 0.5
+
 def _clean_daily_hours(timesheets: pd.DataFrame) -> pd.Series:
     daily = timesheets.groupby(["employee_id", "date"])["time"].sum()
     return daily[daily <= MAX_PLAUSIBLE_DAILY_HOURS]
@@ -18,8 +23,28 @@ def _clean_daily_hours(timesheets: pd.DataFrame) -> pd.Series:
 def _latest_timesheet_date(timesheets: pd.DataFrame) -> pd.Timestamp:
     """Anchored on the data's own latest entry, not wall-clock "now" -- these
     are fixed snapshots that stop well before "today" ever ticks past them, so
-    a calendar-relative window would silently go empty once real time moves on."""
-    return timesheets["date"].max().normalize()
+    a calendar-relative window would silently go empty once real time moves on.
+
+    BUT the raw max(date) can itself land inside a sparse, incomplete trailing
+    tail rather than a real full reporting day -- confirmed real case: daily
+    distinct-employee counts here run 400-500+ on genuine dense weekdays, then
+    crater to single/low-double digits for the ~3 weeks immediately before the
+    raw max date (advance/incomplete entries, not the whole company logging a
+    real day). Anchoring there silently starves every "last N days" window of
+    real data -- confirmed this was the reason company-wide sustained-overtime
+    showed 0 even though real dense recent data exists just a few weeks earlier.
+    Walks back to the latest date whose distinct-employee count is still a
+    meaningful fraction (MIN_DAILY_COVERAGE_RATIO) of the dataset's own p75 daily
+    headcount, so the anchor lands on the last genuinely representative day
+    instead of the tail of a data-generation artifact."""
+    daily_employees = timesheets.groupby("date")["employee_id"].nunique()
+    if daily_employees.empty:
+        return timesheets["date"].max().normalize()
+    baseline = daily_employees.quantile(0.75)
+    real_days = daily_employees[daily_employees >= baseline * MIN_DAILY_COVERAGE_RATIO]
+    if real_days.empty:
+        return timesheets["date"].max().normalize()
+    return real_days.index.max().normalize()
 
 def get_employee_overtime_risk() -> dict[str, dict]:
     adapter = get_adapter()

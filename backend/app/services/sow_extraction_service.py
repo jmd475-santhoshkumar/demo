@@ -7,7 +7,7 @@ Grounding rules, same posture as resume_skill_service.py:
   - Roles: extracted only from staffing/resourcing text that's actually in
     the SOW (e.g. a "Resources" table listing designations and headcounts),
     never invented. Each extracted role is cross-checked against the org's
-    real designation list (01_Employee_Details_clean.csv) and flagged
+    real, current designation list (adapter.get_employees()) and flagged
     matches_real_designation so a "Snr. Oversight" (an engagement-level
     label, not an HR designation) reads differently from a "Solutions
     Consultant" (a real designation) -- this is the accuracy signal the
@@ -39,11 +39,11 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 from app.ai import llm
-from app.core.config import APP_STATE_DIR, TRANSFORMED_DIR
+from app.core.adapter import get_adapter
+from app.core.config import APP_STATE_DIR
 from app.services.project_sow_service import get_sow_file_path
 
 EXTRACTIONS_JSON_PATH = APP_STATE_DIR / "sow_extractions.json"
-EMPLOYEES_CSV_PATH = TRANSFORMED_DIR / "01_Employee_Details_clean.csv"
 
 MAX_SOW_CHARS = 20000
 
@@ -110,7 +110,7 @@ def _extract_text(filename: str, content: bytes) -> str:
 
 
 def _real_designations() -> list[str]:
-    df = pd.read_csv(EMPLOYEES_CSV_PATH, dtype=str)
+    df = get_adapter().get_employees()
     return sorted(df["job_name"].dropna().str.strip().unique().tolist())
 
 
@@ -205,8 +205,138 @@ def _index_key(project_code: str, filename: str) -> str:
     return f"{project_code}::{filename}"
 
 
+def _contains_ci(haystack: str, needle: str) -> bool:
+    return bool(needle) and bool(haystack) and needle.strip().lower() in haystack.strip().lower()
+
+
+def _detect_project_mismatch(record: dict, project_code: str) -> str | None:
+    """Flags when an uploaded SOW's own stated client name and/or internal
+    project reference don't match the REAL project it was uploaded against --
+    confirmed real need: a SOW for a completely different engagement (a
+    different client, a different internal reference code) can be uploaded to
+    the wrong project by mistake (e.g. for local testing), and nothing else on
+    this page catches that. Deliberately a real-fields-only substring check
+    (no fuzzy/LLM matching) -- client_id sometimes holds a real readable name
+    when project_name is blank (confirmed real case: DEX_002 has a blank
+    project_name but client_id "Dexters DXT_005"), so both are checked."""
+    project_reference = (record.get("project_reference") or "").strip()
+    client_name = (record.get("client_name") or "").strip()
+    if not project_reference and not client_name:
+        return None
+
+    def _real_field(row, col: str) -> str:
+        v = row.get(col)
+        return " ".join(str(v).split()) if pd.notna(v) else ""
+
+    projects = get_adapter().get_projects()
+    match = projects[projects["project_code"] == project_code]
+    real_project_name = _real_field(match.iloc[0], "project_name") if not match.empty else ""
+    real_client_id = _real_field(match.iloc[0], "client_id") if not match.empty else ""
+    real_labels = f"{real_project_name} {real_client_id}".strip()
+
+    reference_ok = not project_reference or _contains_ci(project_code, project_reference) or _contains_ci(real_labels, project_reference)
+    client_ok = not client_name or _contains_ci(real_labels, client_name)
+    if reference_ok and client_ok:
+        return None
+
+    stated = []
+    if project_reference and not reference_ok:
+        stated.append(f'project reference "{project_reference}"')
+    if client_name and not client_ok:
+        stated.append(f'client "{client_name}"')
+    real_desc = real_labels if real_labels else "no name/client on record"
+    return (
+        f"This SOW states {' and '.join(stated)}, which doesn't match {project_code} ({real_desc}) -- "
+        "double check this is the right document for this project."
+    )
+
+
 def get_cached_extraction(project_code: str, filename: str) -> dict | None:
-    return _load_extractions_index().get(_index_key(project_code, filename))
+    record = _load_extractions_index().get(_index_key(project_code, filename))
+    if record is None:
+        return None
+    return {**record, "project_mismatch_warning": _detect_project_mismatch(record, project_code)}
+
+
+def _all_cached_extractions_for_project(project_code: str) -> list[dict]:
+    return [v for v in _load_extractions_index().values() if v.get("project_code") == project_code]
+
+
+def _resolve_named_person(name: str, employees: pd.DataFrame) -> str | None:
+    """Exact, case-insensitive match against real employee_full_name only --
+    deliberately no fuzzy matching. Misidentifying which real employee a SOW
+    named would be a worse error than just leaving it unresolved (shown to the
+    RM as "named in SOW, not matched" instead of silently picking the wrong
+    person). Ambiguous (2+ employees share the exact name) also resolves to
+    None for the same reason."""
+    target = name.strip().lower()
+    if not target:
+        return None
+    matches = employees[employees["employee_full_name"].astype(str).str.strip().str.lower() == target]
+    if len(matches) == 1:
+        return str(matches.iloc[0]["employee_id"])
+    return None
+
+
+def compare_sow_to_budget(project_code: str) -> dict:
+    """Cross-references every real SOW extraction on file for this project
+    against the real Budget Creation line items, so an RM can see whether what
+    was actually budgeted/staffed matches what the signed SOW asked for --
+    plus surfaces any real named person the SOW specified for a role, resolved
+    to a real employee_id wherever the name exactly matches one real employee.
+    """
+    from app.services.project_budget_service import get_budget
+
+    extractions = _all_cached_extractions_for_project(project_code)
+    employees = get_adapter().get_employees()
+
+    sow_role_counts: dict[str, int] = {}
+    named_people: list[dict] = []
+    for ext in extractions:
+        for r in ext.get("roles_required", []):
+            if r.get("matches_real_designation"):
+                role = r["role_text"]
+                sow_role_counts[role] = sow_role_counts.get(role, 0) + int(r.get("count", 1))
+            if r.get("named_person"):
+                named_people.append({
+                    "role_text": r["role_text"],
+                    "matches_real_designation": bool(r.get("matches_real_designation")),
+                    "named_person": r["named_person"],
+                    "resolved_employee_id": _resolve_named_person(r["named_person"], employees),
+                    "source_filename": ext.get("filename"),
+                })
+
+    budget = get_budget(project_code)
+    budget_line_items = (budget.get("line_items") if budget else None) or []
+    budget_role_counts: dict[str, int] = {}
+    for li in budget_line_items:
+        designation = (li.get("designation") or "").strip()
+        if designation:
+            budget_role_counts[designation] = budget_role_counts.get(designation, 0) + 1
+
+    all_roles = sorted(set(sow_role_counts) | set(budget_role_counts))
+    role_comparison = [
+        {
+            "role": role,
+            "sow_count": sow_role_counts.get(role, 0),
+            "budget_count": budget_role_counts.get(role, 0),
+            "aligned": sow_role_counts.get(role, 0) == budget_role_counts.get(role, 0),
+        }
+        for role in all_roles
+    ]
+    unmatched_sow_roles = sorted({
+        r["role_text"] for ext in extractions for r in ext.get("roles_required", [])
+        if not r.get("matches_real_designation")
+    })
+
+    return {
+        "has_sow_data": bool(extractions),
+        "has_budget_data": bool(budget_line_items),
+        "role_comparison": role_comparison,
+        "fully_aligned": all(r["aligned"] for r in role_comparison) if role_comparison else None,
+        "unmatched_sow_roles": unmatched_sow_roles,
+        "named_people": named_people,
+    }
 
 
 def extract_sow_requirements(project_code: str, filename: str) -> dict:
@@ -253,4 +383,4 @@ def extract_sow_requirements(project_code: str, filename: str) -> dict:
     index = _load_extractions_index()
     index[_index_key(project_code, filename)] = record
     _save_extractions_index(index)
-    return record
+    return {**record, "project_mismatch_warning": _detect_project_mismatch(record, project_code)}

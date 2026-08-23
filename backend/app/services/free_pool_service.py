@@ -3,7 +3,7 @@ import pandas as pd
 from app.core.adapter import get_adapter
 from app.engines.employee_coe import get_employee_primary_coe_map
 from app.engines import availability_hold
-from app.services.allocation_report_service import INTERNAL_PROJECT_TYPE, UNDER_UTILIZED_THRESHOLD, get_allocation_report
+from app.services.allocation_report_service import NON_CLIENT_PROJECT_TYPES, UNDER_UTILIZED_THRESHOLD, get_allocation_report
 from app.services.rate_card_service import get_hourly_rate
 
 STANDARD_MONTHLY_HOURS = 160
@@ -14,7 +14,7 @@ def _idle_value_usd_per_month(job_name, idle_pct: float) -> float | None:
         return None
     return round((idle_pct / 100) * rate * STANDARD_MONTHLY_HOURS, 0)
 
-def get_free_pool(include_redeploy_summary: bool = True) -> list[dict]:
+def get_free_pool(include_redeploy_summary: bool = True, jmd_only: bool = False) -> list[dict]:
     from app.services.recommendation_service import NON_DELIVERY_ROLES  # local to avoid circular import
     adapter = get_adapter()
     employees = adapter.get_employees()
@@ -23,12 +23,17 @@ def get_free_pool(include_redeploy_summary: bool = True) -> list[dict]:
     coe_map = get_employee_primary_coe_map()
     today = pd.Timestamp.now().normalize()
 
-    delivery_ids = set(
-        employees[
-            (employees["account_status"] == 1)
-            & (~employees["job_name"].isin(NON_DELIVERY_ROLES))
-        ]["employee_id"]
-    )
+    delivery_mask = (employees["account_status"] == 1) & (~employees["job_name"].isin(NON_DELIVERY_ROLES))
+    # jmd_only scopes the Free Pool PAGE specifically to the real JMD entity (confirmed
+    # with the Resource Manager as "delivery staff" -- same definition now used for the
+    # Dashboard's Delivery Staff card). Deliberately an opt-in parameter, default off --
+    # Health's relief-staffing, Leave's backfill matching, and the Dashboard's own free-pool
+    # counts all call this same function and should keep matching against the FULL
+    # delivery-capable workforce (JMG/JML/JMU can be genuine candidates there too), not
+    # silently narrow to JMD the moment this page's own scope changes.
+    if jmd_only:
+        delivery_mask = delivery_mask & employees["employee_id"].astype(str).str.startswith("JMD")
+    delivery_ids = set(employees[delivery_mask]["employee_id"])
 
     ended = allocations[allocations["allocated_end_date"] < today]
     # .last() after an ascending sort carries the project_id of that specific max-date
@@ -40,9 +45,11 @@ def get_free_pool(include_redeploy_summary: bool = True) -> list[dict]:
     for r in report:
         if r["employee_id"] not in delivery_ids:
             continue
-        # An ending internal-project allocation doesn't free up "capacity" in any real
-        # sense -- it was never blocking client work to begin with.
-        if r["ending_soon"] and r["type_of_project"] != INTERNAL_PROJECT_TYPE:
+        # An ending internal/BAU/sales-bucket allocation doesn't free up "capacity" in any
+        # real sense -- it was never blocking client work to begin with. Checks the full
+        # NON_CLIENT_PROJECT_TYPES set, not just Internal Project alone, so a BAU/Sales
+        # placeholder row ending doesn't get mistaken for real capacity freeing up either.
+        if r["ending_soon"] and r["type_of_project"] not in NON_CLIENT_PROJECT_TYPES:
             ending_rows_by_emp.setdefault(r["employee_id"], []).append(r)
 
     pool: dict[str, dict] = {}
@@ -60,27 +67,45 @@ def get_free_pool(include_redeploy_summary: bool = True) -> list[dict]:
             ],
         }
 
+    # Judged on client-only allocation, not utilization_band's total-based check --
+    # someone fully loaded with internal work but with no/low client allocation is
+    # genuinely available for new client work, even though their total looks busy.
+    # Real per-employee client-allocation % (same value repeated on every one of that
+    # employee's rows in `report` -- last-write-wins is fine, safe to just overwrite).
+    client_pct_by_emp: dict[str, float] = {}
+    for r in report:
+        if r["employee_id"] in delivery_ids:
+            client_pct_by_emp[r["employee_id"]] = r["employee_client_allocation_pct"]
+
     for r in report:
         emp_id = r["employee_id"]
         if emp_id not in delivery_ids:
             continue
         if emp_id in pool:
             continue
-        # Judged on client-only allocation, not utilization_band's total-based check --
-        # someone fully loaded with internal work but with no/low client allocation is
-        # genuinely available for new client work, even though their total looks busy.
-        if r["employee_client_allocation_pct"] < UNDER_UTILIZED_THRESHOLD:
+        # Strictly between 0 and the threshold -- 0% real client allocation isn't
+        # "under-utilized", it's "fully free" (see below). Splitting it out here is
+        # what actually makes "fully free" reachable: real data shows virtually every
+        # employee carries SOME Internal Project/BAU Activity/Sales Activity placeholder
+        # allocation row (confirmed real case: one BAU bucket alone logs ~987 of the
+        # whole company), so "zero allocation rows of any kind" -- the old fully_free
+        # definition -- almost never actually happens, even for someone with genuinely
+        # zero real client work.
+        if 0 < r["employee_client_allocation_pct"] < UNDER_UTILIZED_THRESHOLD:
             pool[emp_id] = {
                 "employee_id": emp_id, "job_name": r["job_name"], "department_name": r["department_name"],
                 "location": r["location"], "reason": "under_utilized", "project_id": r["project_id"],
                 "current_allocation_pct": r["employee_client_allocation_pct"],
             }
 
-    allocated_ids = {r["employee_id"] for r in report}
+    fully_free_ids = {
+        emp_id for emp_id in delivery_ids
+        if emp_id not in pool and client_pct_by_emp.get(emp_id, 0.0) == 0.0
+    }
     fully_free = employees[
         (employees["account_status"] == 1)
         & (~employees["job_name"].isin(NON_DELIVERY_ROLES))
-        & (~employees["employee_id"].isin(allocated_ids))
+        & (employees["employee_id"].isin(fully_free_ids))
     ]
     for _, row in fully_free.iterrows():
         pool.setdefault(row["employee_id"], {

@@ -23,7 +23,9 @@ def get_project_burnout_overview() -> dict:
     }
 
 def get_employee_burnout_overview() -> dict:
-    """Sustained overtime: real, precise overwork signal (>9h on 4+ of last 14 days)."""
+    """Sustained overtime: real, precise overwork signal (>=11h on 4+ of last 14 days --
+    see timesheet_insights_service.OVERTIME_DAILY_HOURS_THRESHOLD/SUSTAINED_OVERTIME_MIN_DAYS,
+    the actual enforced constants)."""
     adapter = get_adapter()
     employees = adapter.get_employees()
     job_name_by_id = employees.set_index("employee_id")["job_name"].to_dict()
@@ -40,8 +42,10 @@ def get_employee_burnout_overview() -> dict:
 
     # Weekly Pulse: a separate signal from timesheet-hours burnout, not blended
     # into it -- someone can be "Not happy" with no overtime at all (or vice
-    # versa). "Not happy" fires from a single Disagree/Strongly disagree answer
-    # on q1/q2/q5 in any recent response, not an average -- see pulse_engine.
+    # versa). "Not happy" is the top NOT_HAPPY_TOP_N most severe real cases
+    # (most recent bad q1/q2/q5 responses, worst average score as a tiebreaker),
+    # not a fixed share/count threshold -- see pulse_engine.NOT_HAPPY_TOP_N's
+    # docstring for why a ranked list, not a threshold, is used here.
     pulse_table = get_employee_pulse_table()
 
     risk = get_employee_overtime_risk()

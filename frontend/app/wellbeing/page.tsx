@@ -184,7 +184,12 @@ function ProjectsTab() {
   let rows = signal === "healthy" ? (healthProjects.data ?? []).filter((r) => !flaggedCodes.has(r.project_code)) : overview.data.projects;
   const q = search.trim().toLowerCase();
   if (q) {
-    rows = rows.filter((r) => r.project_code.toLowerCase().includes(q) || (r.client_id ?? "").toLowerCase().includes(q));
+    rows = rows.filter(
+      (r) =>
+        r.project_code.toLowerCase().includes(q) ||
+        (r.project_name ?? "").toLowerCase().includes(q) ||
+        (r.client_id ?? "").toLowerCase().includes(q)
+    );
   }
   if (signal === "overtime" || signal === "understaffed") {
     rows = rows.filter((r) => (signal === "overtime" ? r.root_causes.includes("overtime_risk") : r.root_causes.includes("understaffed")));
@@ -277,7 +282,12 @@ function ProjectsTab() {
                     onClick={() => setSelectedProject(r.project_code)}
                   >
                     <td className="px-3 py-2 font-medium text-primary whitespace-nowrap">{r.project_code}</td>
-                    <td className="px-3 py-2 text-gray-500 dark:text-gray-400 whitespace-nowrap">{r.client_id ?? "-"}</td>
+                    <td className="px-3 py-2 text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                      {/* client_id is frequently an opaque internal UUID with no name-lookup table
+                          (see experience_engine.py's own note on this) -- project_name is the real,
+                          readable label when one exists, so it's shown here instead of a raw GUID. */}
+                      {r.project_name || r.client_id || "-"}
+                    </td>
                     <td className="px-3 py-2 text-gray-500 dark:text-gray-400">{signal === "healthy" ? "No active risk signals" : supportReason(r)}</td>
                     <td className="px-3 py-2 text-gray-500 dark:text-gray-400 whitespace-nowrap">{r.overtime_employee_count}</td>
                     <td className="px-3 py-2 text-gray-500 dark:text-gray-400 whitespace-nowrap">{r.n_employees} / {r.expected_headcount ?? "?"}</td>
@@ -415,7 +425,7 @@ function EmployeesTab() {
           icon={HeartPulse}
           label="Not Happy"
           value={overview.data.not_happy_count}
-          sub="Disagreed on project fit/support/workload, last 4wks"
+          sub="Disagreed on project fit/support/workload, last 4wks -- synthetic pulse survey data, not real responses"
           theme="rose"
           onClick={() => setSignal("not_happy")}
           active={signal === "not_happy"}

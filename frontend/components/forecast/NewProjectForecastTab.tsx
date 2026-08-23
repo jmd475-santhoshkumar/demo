@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Plus, Trash2, AlertTriangle, ChevronDown, ChevronUp, X, Search } from "lucide-react";
+import { Plus, AlertTriangle, ChevronDown, ChevronUp, X, Search } from "lucide-react";
 import {
   api, DEFAULT_INCLUDE_PARAMS,
   type ForecastBreakdownRow, type ForecastSpec, type RecommendationCandidate, type RedeployCandidate,
@@ -1378,10 +1378,11 @@ export function NewProjectForecastTab() {
   const [mode, setMode] = useState<ForecastMode>("spec");
   const coeOptions = useQuery({ queryKey: ["role-mix-coes"], queryFn: api.roleMixCoes });
   const categories = useQuery({ queryKey: ["role-mix-categories"], queryFn: api.roleMixCategories });
-  const designations = useQuery({ queryKey: ["employee-designations"], queryFn: api.employeeDesignations });
+  const designations = useQuery({ queryKey: ["employee-designations"], queryFn: () => api.employeeDesignations() });
   const knownDesignations = new Set((designations.data ?? []).map((d) => d.toLowerCase()));
 
   const [specs, setSpecs] = useState<SpecState[]>([blankSpec()]);
+  const [activeSpecIndex, setActiveSpecIndex] = useState(0);
   const [rareRolesOpen, setRareRolesOpen] = useState(false);
   const [skillDrafts, setSkillDrafts] = useState<Record<number, string>>({});
   const [roleDrafts, setRoleDrafts] = useState<Record<number, { designation: string; headcount: string; pct: string }>>({});
@@ -1563,6 +1564,17 @@ export function NewProjectForecastTab() {
     setSkillDrafts((prev) => ({ ...prev, [specIndex]: "" }));
   }
 
+  function addSpec() {
+    setSpecs((prev) => [...prev, blankSpec()]);
+    setActiveSpecIndex(specs.length);
+  }
+
+  function removeSpec(index: number) {
+    if (specs.length === 1) return;
+    setSpecs((prev) => prev.filter((_, idx) => idx !== index));
+    setActiveSpecIndex((prev) => (index <= prev ? Math.max(0, prev - 1) : prev));
+  }
+
   const anyPreviewLoading = specs.some((s) => s.previewLoading);
 
   return (
@@ -1619,31 +1631,40 @@ export function NewProjectForecastTab() {
           ))}
         </datalist>
 
-        {specs.map((spec, i) => (
-          <div key={i} className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-semibold text-gray-700 dark:text-gray-300">Project spec {i + 1}</p>
-              <div className="flex items-center gap-2">
-                <label className="text-[11px] text-gray-400 dark:text-gray-500">Count</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={spec.count}
-                  onChange={(e) =>
-                    setSpecs((prev) => prev.map((s, idx) => (idx !== i ? s : { ...s, count: Math.max(1, parseInt(e.target.value) || 1) })))
-                  }
-                  className="w-16 px-2 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-xs outline-none"
-                />
+        <div className="flex items-center gap-1 border-b border-gray-200 dark:border-gray-700 overflow-x-auto">
+          {specs.map((spec, i) => (
+            <div
+              key={i}
+              onClick={() => setActiveSpecIndex(i)}
+              className={cn(
+                "group flex items-center gap-1.5 px-3 py-2 text-xs font-medium border-b-2 -mb-px cursor-pointer whitespace-nowrap transition flex-shrink-0",
+                i === activeSpecIndex
+                  ? "border-primary text-primary bg-primary/5"
+                  : "border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800/60"
+              )}
+            >
+              <span>Project spec {i + 1}</span>
+              {specs.length > 1 && (
                 <button
-                  onClick={() => setSpecs((prev) => prev.filter((_, idx) => idx !== i))}
-                  disabled={specs.length === 1}
-                  className="p-1.5 rounded-lg text-gray-300 dark:text-gray-600 hover:text-red-400 dark:hover:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 disabled:opacity-30 transition"
+                  onClick={(e) => { e.stopPropagation(); removeSpec(i); }}
+                  className="p-0.5 rounded text-gray-300 dark:text-gray-600 hover:text-red-400 dark:hover:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 opacity-0 group-hover:opacity-100 transition"
                 >
-                  <Trash2 className="w-3.5 h-3.5" />
+                  <X className="w-3 h-3" />
                 </button>
-              </div>
+              )}
             </div>
+          ))}
+          <button
+            onClick={addSpec}
+            title="Add project"
+            className="flex items-center justify-center p-2 text-gray-400 dark:text-gray-500 hover:text-primary transition flex-shrink-0"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        </div>
 
+        {specs.map((spec, i) => (
+          <div key={i} className={cn("rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 p-4 space-y-3", i !== activeSpecIndex && "hidden")}>
             <div className="flex items-center gap-3 flex-wrap">
               <div>
                 <label className="text-[10px] text-gray-400 dark:text-gray-500 block mb-0.5">Start date</label>
@@ -1663,6 +1684,18 @@ export function NewProjectForecastTab() {
                   onChange={(e) => setSpecs((prev) => prev.map((s, idx) => (idx !== i ? s : { ...s, durationWeeks: e.target.value })))}
                   placeholder="e.g. 12"
                   className="w-28 px-2 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-xs outline-none"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-gray-400 dark:text-gray-500 block mb-0.5">Count</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={spec.count}
+                  onChange={(e) =>
+                    setSpecs((prev) => prev.map((s, idx) => (idx !== i ? s : { ...s, count: Math.max(1, parseInt(e.target.value) || 1) })))
+                  }
+                  className="w-16 px-2 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-xs outline-none"
                 />
               </div>
               {spec.durationWeeks && !Number.isNaN(parseInt(spec.durationWeeks, 10)) && (
@@ -1868,7 +1901,7 @@ export function NewProjectForecastTab() {
 
         <div className="flex items-center justify-between">
           <button
-            onClick={() => setSpecs((prev) => [...prev, blankSpec()])}
+            onClick={addSpec}
             className="flex items-center gap-1.5 text-xs text-primary hover:underline"
           >
             <Plus className="w-3.5 h-3.5" /> Add project

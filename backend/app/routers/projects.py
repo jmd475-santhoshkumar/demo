@@ -13,7 +13,12 @@ from app.services.project_service import (
 from app.services.docx_conversion_service import DocxConversionError, get_or_convert_pdf
 from app.services.project_sow_service import get_sow_file_path, list_sow_files, save_sow_file
 from app.services.sow_chat_service import SowChatError, ask_sow_question
-from app.services.sow_extraction_service import SowExtractionError, extract_sow_requirements, get_cached_extraction
+from app.services.sow_extraction_service import (
+    SowExtractionError,
+    compare_sow_to_budget,
+    extract_sow_requirements,
+    get_cached_extraction,
+)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -137,6 +142,15 @@ def sow_list(project_code: str) -> list[dict]:
 async def sow_upload(project_code: str, file: UploadFile = File(...)) -> dict:
     content = await file.read()
     return save_sow_file(project_code, file.filename, content)
+
+@router.get("/{project_code}/sow/compare-budget")
+def sow_compare_budget(project_code: str) -> dict:
+    """Cross-checks every real SOW extraction on file for this project against
+    the real Budget Creation line items -- role-count alignment plus any real
+    named person the SOW specified, resolved to a real employee_id where the
+    name exactly matches one real employee. Declared before the /{filename}
+    route below so "compare-budget" is never swallowed as a literal filename."""
+    return compare_sow_to_budget(project_code)
 
 @router.get("/{project_code}/sow/{filename}")
 def sow_download(project_code: str, filename: str) -> FileResponse:

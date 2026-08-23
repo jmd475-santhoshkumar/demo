@@ -772,11 +772,23 @@ def compute_devops_extension_risk(
     # actually near its end (within_risk_window) or already overdue. A project
     # with a month of runway left having one blocked ticket is normal, not an
     # extension risk.
+    #
+    # Blocked/past-due tickets ALSO don't matter, even near the end, when the team
+    # already has a comfortable capacity surplus to absorb them -- confirmed real
+    # false-positive case: a project flagged solely for "11 blocked tickets" while
+    # sitting on a 197.5h capacity surplus (330h available vs. 132.5h of real
+    # remaining work, 2.5x over). With that much slack, a handful of blocked
+    # tickets is normal DevOps friction the team has plenty of room to resolve,
+    # not a real threat to the deadline. Only gates the near-end case, not
+    # is_overdue -- once a project is actually past its own end date, there's no
+    # more runway for "surplus" to mean anything, so any lingering blocker still
+    # counts.
+    has_capacity_surplus = within_risk_window and capacity_after_leave > stats["remaining_hours"]
     has_risk = bool(
         (within_risk_window or is_overdue)
         and (
-            stats["blocked_count"] > 0
-            or tickets_past_due > 0
+            (stats["blocked_count"] > 0 and not has_capacity_surplus)
+            or (tickets_past_due > 0 and not has_capacity_surplus)
             or (within_risk_window and stats["remaining_hours"] > capacity_after_leave)
             or (is_overdue and stats["open_count"] > 0)
         )

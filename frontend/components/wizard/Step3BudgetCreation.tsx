@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2 } from "lucide-react";
+import { useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-query";
+import { Plus, Trash2, Loader2 } from "lucide-react";
 import { api, type BudgetLineItem, type DealSummary } from "@/lib/api";
 import { SearchableSelect } from "@/components/shared/SearchableSelect";
+import { TeamRecommendationPanel } from "@/components/shared/TeamRecommendationPanel";
+import { ProjectHealthDetailModal } from "@/components/health/ProjectHealthDetailModal";
 import { StepPlaceholder } from "@/components/wizard/StepPlaceholder";
 import {
   BILLING_CURRENCY_OPTIONS, ENGAGEMENT_STYLE_OPTIONS, PAYMENT_TERM_OPTIONS, PROPOSITION_COE_OPTIONS, JMAN_LOCATIONS,
@@ -18,7 +20,6 @@ type Tab = "fees" | "discount" | "planned_cost";
 // auto-generation already uses (backend/app/engines/role_mix_engine.py) --
 // reused here rather than re-hardcoding the same numbers a second time.
 const DELIVERY_STANDARD_TEAM = "Delivery Project - Standard Team";
-const DND_TACTICAL_BUILD = "D&D Tactical Build";
 
 function blankRow(defaultDate: string): BudgetLineItem {
   return {
@@ -51,7 +52,9 @@ export function Step3BudgetCreation({
     queryFn: () => api.getProjectBudget(projectCode as string),
     enabled: projectCode != null,
   });
-  const designations = useQuery({ queryKey: ["employee-designations"], queryFn: api.employeeDesignations });
+  // Delivery/billable roles only -- a project budget line item should never
+  // offer HR, Finance, Legal, IT-support, or exec/admin titles as a "role".
+  const designations = useQuery({ queryKey: ["employee-designations", "delivery"], queryFn: () => api.employeeDesignations(true) });
   const roleMixCategories = useQuery({ queryKey: ["role-mix-categories"], queryFn: api.roleMixCategories });
 
   const [tab, setTab] = useState<Tab>("fees");
@@ -67,9 +70,25 @@ export function Step3BudgetCreation({
   const [paymentTermPct, setPaymentTermPct] = useState(0);
   const [isBillable, setIsBillable] = useState(defaultIsBillable);
   const [rows, setRows] = useState<BudgetLineItem[]>([blankRow(defaultStartDate)]);
+  // Real-precedent check on the CURRENTLY selected headcount for this
+  // project's type/CoE -- not a wholesale team suggestion, just whether
+  // this size (or one person more/fewer) historically stayed clean. Refetches
+  // whenever the actual designations change, not just on mount.
+  const currentDesignationsKey = rows.map((r) => r.designation).filter(Boolean).sort().join("|");
+  const teamSizeFit = useQuery({
+    queryKey: ["role-mix-team-size-fit", projectCode, currentDesignationsKey],
+    queryFn: () => api.roleMixTeamSizeFit(projectCode as string, rows.map((r) => r.designation)),
+    enabled: projectCode != null && rows.some((r) => r.designation),
+    // Keep showing the previous result while a new one loads (e.g. right
+    // after adding/removing a role) instead of the panel blinking out and
+    // back in -- only the very first check for this project has no prior
+    // result to hold onto, which is what the loading state below covers.
+    placeholderData: keepPreviousData,
+  });
   const [hourlyRateCache, setHourlyRateCache] = useState<Record<string, number | null>>({});
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [detailProjectCode, setDetailProjectCode] = useState<string | null>(null);
   const [templateApplied, setTemplateApplied] = useState(false);
 
   // Consultant-family seats are UK-based by default on these real team
@@ -95,21 +114,49 @@ export function Step3BudgetCreation({
     return out;
   }
 
+  // Minimal-change actions for the team-size-fit panel below -- add/remove
+  // exactly ONE seat of the specific role real precedent data points to,
+  // never a wholesale team replacement (see TeamRecommendationPanel).
+  function addRoleRow(designation: string) {
+    setRows((prev) => [
+      ...prev,
+      {
+        designation, location: defaultLocationForDesignation(designation), estimated_start_date: defaultStartDate,
+        hours_per_day: 8, allocation_pct: 100, working_days: null, base_day_rate: null, eff_day_rate: null,
+      },
+    ]);
+  }
+  function removeRoleRow(designation: string) {
+    setRows((prev) => {
+      const idx = prev.findIndex((r) => r.designation === designation);
+      if (idx === -1) return prev;
+      return prev.filter((_, i) => i !== idx);
+    });
+  }
+
   // The real combination of roles this deal actually requested in the
   // pipeline data (e.g. AP, Sol Con, SSE, SE...) -- takes priority over the
   // generic team template below whenever the deal specifies any.
   function rowsFromDeal(d: DealSummary): BudgetLineItem[] {
+    const known = new Set(designations.data ?? []);
     const items = d.roles.filter((r) => r.requested_designations.length > 0);
-    return items.map((r) => ({
-      designation: r.requested_designations[0],
-      location: defaultLocationForDesignation(r.requested_designations[0]),
-      estimated_start_date: r.likely_start_date || defaultStartDate,
-      hours_per_day: 8,
-      allocation_pct: r.requested_pct ? Number(r.requested_pct) || 100 : 100,
-      working_days: null,
-      base_day_rate: null,
-      eff_day_rate: null,
-    }));
+    return items.map((r) => {
+      // Pipeline data sometimes lists a real, valid title alongside a raw
+      // variant of it (e.g. "Technical Solutions Architect" next to the
+      // actual "Technology Solutions Architect") -- always taking index 0
+      // meant a real, known role could land as an unmatched, unselected
+      // dropdown just because the wrong alias happened to come first.
+      const designation = r.requested_designations.find((name) => known.has(name)) ?? r.requested_designations[0];
+      return {
+        designation, location: defaultLocationForDesignation(designation),
+        estimated_start_date: r.likely_start_date || defaultStartDate,
+        hours_per_day: 8,
+        allocation_pct: r.requested_pct ? Number(r.requested_pct) || 100 : 100,
+        working_days: null,
+        base_day_rate: null,
+        eff_day_rate: null,
+      };
+    });
   }
 
   // Pre-fill a brand-new budget by default instead of one blank row, so the
@@ -118,14 +165,14 @@ export function Step3BudgetCreation({
   // generic DELIVERY_STANDARD_TEAM template. Skipped once a real saved budget exists.
   useEffect(() => {
     if (templateApplied || loadedFromServer) return;
-    if (existing.isLoading || roleMixCategories.isLoading) return;
+    if (existing.isLoading || roleMixCategories.isLoading || designations.isLoading) return;
     const savedLineItems = (existing.data as { line_items?: unknown[] } | null)?.line_items;
     if (Array.isArray(savedLineItems) && savedLineItems.length > 0) { setTemplateApplied(true); return; }
     const dealRows = deal ? rowsFromDeal(deal) : [];
     setRows(dealRows.length > 0 ? dealRows : rowsFromTemplate(DELIVERY_STANDARD_TEAM));
     setTemplateApplied(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [templateApplied, loadedFromServer, existing.isLoading, existing.data, roleMixCategories.isLoading, deal]);
+  }, [templateApplied, loadedFromServer, existing.isLoading, existing.data, roleMixCategories.isLoading, designations.isLoading, deal]);
 
   useEffect(() => {
     if (existing.data && !loadedFromServer) {
@@ -147,24 +194,6 @@ export function Step3BudgetCreation({
       setHourlyRateCache((prev) => ({ ...prev, [d]: r.base_day_rate }));
     });
   }, [rows, hourlyRateCache]);
-
-  const [suggestingTeam, setSuggestingTeam] = useState(false);
-
-  // Real typical team composition for the selected proposition_coe, derived
-  // from real APPROVED JIN budgets (see backend jin_budget_service.py) --
-  // manually triggered, never auto-applied, since it replaces whatever rows
-  // are already there (deal-driven or template-driven).
-  async function applySuggestedTeam() {
-    const propositionCoe = propositionCoes[0];
-    if (!propositionCoe) return;
-    setSuggestingTeam(true);
-    try {
-      const suggested = await api.getSuggestedTeam(propositionCoe);
-      if (suggested.length > 0) setRows(suggested);
-    } finally {
-      setSuggestingTeam(false);
-    }
-  }
 
   function updateRow(i: number, patch: Partial<BudgetLineItem>) {
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
@@ -390,29 +419,23 @@ export function Step3BudgetCreation({
 
       {tab === "fees" && (
         <div className="space-y-2">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-[11px] text-gray-400 dark:text-gray-500">Quick-fill a typical team:</span>
-            <button
-              onClick={() => setRows(rowsFromTemplate(DELIVERY_STANDARD_TEAM))}
-              className="text-[11px] px-2.5 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-[hsl(var(--primary))] hover:text-[hsl(var(--primary))]"
-            >
-              Delivery Team (2 Engineers, 1 Enabler, 1 Consultant)
-            </button>
-            <button
-              onClick={() => setRows(rowsFromTemplate(DND_TACTICAL_BUILD))}
-              className="text-[11px] px-2.5 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-[hsl(var(--primary))] hover:text-[hsl(var(--primary))]"
-            >
-              D&amp;D Team (Assoc. Consultant, Sr. Engineer, Architect, Consultant)
-            </button>
-            <button
-              onClick={applySuggestedTeam}
-              disabled={!propositionCoes[0] || suggestingTeam}
-              title="Typical team composition from real approved JIN budgets for this Proposition CoE"
-              className="text-[11px] px-2.5 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-[hsl(var(--primary))] hover:text-[hsl(var(--primary))] disabled:opacity-40"
-            >
-              {suggestingTeam ? "Loading..." : "Real team from JIN budgets"}
-            </button>
-          </div>
+          {projectCode && rows.some((r) => r.designation) && (
+            teamSizeFit.isLoading ? (
+              <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2.5 flex items-center gap-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-gray-400 dark:text-gray-500" />
+                <span className="text-[11px] text-gray-400 dark:text-gray-500">Checking this team size against real precedent projects…</span>
+              </div>
+            ) : teamSizeFit.data ? (
+              <TeamRecommendationPanel
+                data={teamSizeFit.data}
+                onAddRole={addRoleRow}
+                onRemoveRole={removeRoleRow}
+                onSelectProject={setDetailProjectCode}
+                isUpdating={teamSizeFit.isFetching}
+              />
+            ) : null
+          )}
+
         <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full text-[11px]">
@@ -525,6 +548,10 @@ export function Step3BudgetCreation({
           {submitting ? "Saving…" : "Save & Next"}
         </button>
       </div>
+
+      {detailProjectCode && (
+        <ProjectHealthDetailModal projectCode={detailProjectCode} onClose={() => setDetailProjectCode(null)} />
+      )}
     </div>
   );
 }

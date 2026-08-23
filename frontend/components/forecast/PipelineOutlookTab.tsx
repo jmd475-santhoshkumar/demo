@@ -624,7 +624,10 @@ function DrilldownContent({
     <div className="p-4 space-y-4 max-h-[75vh] overflow-y-auto">
       {result.deals.length > 0 && (
         <div className="rounded-lg bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 px-3 py-2 flex flex-wrap gap-4 text-[11px]">
-          <span className="text-gray-500 dark:text-gray-400">{result.deals.length} real deal(s)</span>
+          <span className="text-gray-500 dark:text-gray-400">
+            {uniqueDeals.length} real deal{uniqueDeals.length === 1 ? "" : "s"}
+            {result.deals.length !== uniqueDeals.length && ` (${result.deals.length} role request${result.deals.length === 1 ? "" : "s"})`}
+          </span>
           {totalValue > 0 && <span className="text-gray-700 dark:text-gray-300 font-medium">sum value: {formatUsd(totalValue)}</span>}
         </div>
       )}
@@ -632,8 +635,8 @@ function DrilldownContent({
         <div>
           <p className="text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-1.5">Real pipeline deals</p>
           <div className="divide-y divide-gray-50 dark:divide-gray-800">
-            {result.deals.map((d, i) => (
-              <DealRow key={i} deal={d} />
+            {groupByDeal(result.deals).map((roles, i) => (
+              <ProjectCard key={i} roles={roles} />
             ))}
           </div>
         </div>
@@ -672,53 +675,93 @@ function DrilldownContent({
   );
 }
 
-function DealRow({ deal: d }: { deal: OutlookDrilldownDeal }) {
+// One real deal_id is one real project, made of one or more requested-role rows sharing
+// the same client/cluster/EM/solution/SOW status (ffilled from the source's first row per
+// deal) -- grouping here so the UI shows one project card with N nested roles, instead of
+// N separate top-level rows each redundantly repeating the SAME flat project value, which
+// read as N separate $35K projects when it's really one.
+function groupByDeal(deals: OutlookDrilldownDeal[]): OutlookDrilldownDeal[][] {
+  const groups = new Map<string, OutlookDrilldownDeal[]>();
+  deals.forEach((d, i) => {
+    const key = d.deal_id != null ? String(d.deal_id) : `__no_deal_id_${i}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(d);
+  });
+  return [...groups.values()];
+}
+
+function ProjectCard({ roles }: { roles: OutlookDrilldownDeal[] }) {
   const [open, setOpen] = useState(false);
+  const head = roles[0]; // deal-level fields are identical across every role row in this group
   return (
     <div className="py-1.5 text-[11px]">
       <button onClick={() => setOpen((v) => !v)} className="w-full flex items-center gap-2 text-left">
         {open ? <ChevronUp className="w-3 h-3 text-gray-300 dark:text-gray-600 flex-shrink-0" /> : <ChevronDown className="w-3 h-3 text-gray-300 dark:text-gray-600 flex-shrink-0" />}
-        <span className="font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">{d.client}</span>
-        <span className="text-gray-400 dark:text-gray-500 whitespace-nowrap">Cluster {d.cluster}</span>
-        <span className="text-gray-400 dark:text-gray-500 whitespace-nowrap truncate">{d.role_label}</span>
-        <Badge variant={d.is_confirmed ? "green" : "amber"}>{d.is_confirmed ? "SOW signed" : "unconfirmed"}</Badge>
-        {d.value_usd != null && <span className="ml-auto font-semibold text-gray-600 dark:text-gray-400 whitespace-nowrap">{formatUsd(d.value_usd)}</span>}
+        <span className="font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">{head.client}</span>
+        <span className="text-gray-400 dark:text-gray-500 whitespace-nowrap">Cluster {head.cluster}</span>
+        <span className="text-gray-400 dark:text-gray-500 whitespace-nowrap truncate">
+          {roles.length} role{roles.length === 1 ? "" : "s"} requested
+        </span>
+        <Badge variant={head.is_confirmed ? "green" : "amber"}>{head.is_confirmed ? "SOW signed" : "unconfirmed"}</Badge>
+        {head.value_usd != null && <span className="ml-auto font-semibold text-gray-600 dark:text-gray-400 whitespace-nowrap">{formatUsd(head.value_usd)}</span>}
       </button>
       {open && (
         <div className="mt-2 ml-5 space-y-2">
-          {d.value_usd != null && (
+          {head.value_usd != null && (
             <p className="text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/60 rounded-lg px-2 py-1.5">
               Illustrative project value -- anchored to the real ~$35K / 5-week delivery benchmark (same
-              as the Revenue Target tab), flat per project regardless of role mix. Requested %/duration
-              data is too sparse in this source to scale further.
+              as the Revenue Target tab), flat per PROJECT regardless of role mix (shown once here, not
+              once per requested role below). Requested %/duration data is too sparse in this source to
+              scale further.
             </p>
           )}
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-1">
-            <Field label="Deal ID" value={d.deal_id} />
-            <Field label="Client priority" value={d.client_priority} />
-            <Field label="EM" value={d.em} />
-            <Field label="Solution" value={d.solution} />
-            <Field label="Status" value={d.status} />
-            <Field label="Priority" value={d.priority} />
-            <Field label="Role code" value={d.role_code} />
-            <Field label="Resolved designation(s)" value={d.resolved_designations.join(", ") || "none"} />
-            <Field label="Requested %" value={d.requested_pct} />
-            <Field label="Skill areas" value={d.skill_areas.join(", ") || "none"} />
-            <Field label="Request received" value={d.request_received} />
-            <Field label="Original requested start" value={d.original_requested_start_date} />
-            <Field label="Likely start" value={d.likely_start_date} />
-            <Field label="Request type" value={d.request_type} />
-            <Field label="Start date confirmed" value={d.start_date_confirmed} />
-            <Field label="Number of weeks" value={d.number_of_weeks} />
-            <Field label="Deal stage (HubSpot)" value={d.deal_stage_hubspot?.trim()} />
-            <Field label="SOW signed" value={d.sow_signed} />
-            <Field label="Notice days" value={d.notice_days} />
-            <Field label="Late notice" value={d.is_late_notice == null ? null : d.is_late_notice ? "Yes" : "No"} />
+            <Field label="Deal ID" value={head.deal_id} />
+            <Field label="Client priority" value={head.client_priority} />
+            <Field label="EM" value={head.em} />
+            <Field label="Solution" value={head.solution} />
+            <Field label="Request received" value={head.request_received} />
+            <Field label="Original requested start" value={head.original_requested_start_date} />
+            <Field label="Start date confirmed" value={head.start_date_confirmed} />
+            <Field label="Number of weeks" value={head.number_of_weeks} />
+            <Field label="Deal stage (HubSpot)" value={head.deal_stage_hubspot?.trim()} />
+            <Field label="SOW signed" value={head.sow_signed} />
           </div>
-          {d.skillset && <p className="text-gray-400 dark:text-gray-500 italic">&quot;{d.skillset}&quot;</p>}
-          {d.comments && <p className="text-gray-400 dark:text-gray-500">Comments: {d.comments}</p>}
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-1">
+              {roles.length} role{roles.length === 1 ? "" : "s"} requested on this project
+            </p>
+            <div className="divide-y divide-gray-50 dark:divide-gray-800">
+              {roles.map((r, i) => (
+                <RoleRequestRow key={i} r={r} />
+              ))}
+            </div>
+          </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function RoleRequestRow({ r }: { r: OutlookDrilldownDeal }) {
+  return (
+    <div className="py-1.5">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="font-medium text-gray-600 dark:text-gray-400 whitespace-nowrap">{r.role_label}</span>
+        {r.status && <span className="text-gray-400 dark:text-gray-500 whitespace-nowrap">{r.status}</span>}
+        {r.priority && <span className="text-gray-400 dark:text-gray-500 whitespace-nowrap">{r.priority}</span>}
+        {r.likely_start_date && <span className="text-gray-400 dark:text-gray-500 whitespace-nowrap ml-auto">starts {r.likely_start_date}</span>}
+      </div>
+      <div className="mt-1 grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-0.5">
+        <Field label="Role code" value={r.role_code} />
+        <Field label="Resolved designation(s)" value={r.resolved_designations.join(", ") || "none"} />
+        <Field label="Requested %" value={r.requested_pct} />
+        <Field label="Skill areas" value={r.skill_areas.join(", ") || "none"} />
+        <Field label="Notice days" value={r.notice_days} />
+        <Field label="Late notice" value={r.is_late_notice == null ? null : r.is_late_notice ? "Yes" : "No"} />
+      </div>
+      {r.skillset && <p className="text-gray-400 dark:text-gray-500 italic mt-1">&quot;{r.skillset}&quot;</p>}
+      {r.comments && <p className="text-gray-400 dark:text-gray-500 mt-1">Comments: {r.comments}</p>}
     </div>
   );
 }

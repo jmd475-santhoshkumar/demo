@@ -28,6 +28,21 @@ RECENT_WEEKS = 4
 # Score at/below this on ANY of NOT_HAPPY_QUESTIONS = Disagree or Strongly
 # disagree -- the flag trigger. Not an average.
 DISAGREE_MAX_SCORE = 2
+# Employee-level "Not happy" is a ranked TOP-N list, not the same any-single-
+# bad-response trigger the module docstring above describes for a single
+# response's OWN detail view (get_employee_pulse_detail still reports every
+# real bad response it finds). That any-1-response trigger has the exact same
+# statistical problem already identified and fixed for the PROJECT-level Pulse
+# Risk signal below (~26% real per-response bad rate means most employees with
+# a few weeks of responses trip it by chance) -- confirmed flagging 205 of 547
+# real employees with any response in the window, most of it one mild dip, not
+# sustained unhappiness. Unlike projects, a real share/count threshold doesn't
+# resolve this cleanly here: most employees only have 1-2 real responses in
+# the 4-week window at all, so "majority bad" or "2+ bad" still mostly just
+# means "their one thin response was bad." A fixed ranked list of the most
+# severe real cases -- most bad responses, then lowest average score as a
+# tiebreaker -- is the version of this signal an RM can act on.
+NOT_HAPPY_TOP_N = 10
 
 def _recent_pulse(weeks: int = RECENT_WEEKS) -> pd.DataFrame:
     df = get_adapter().get_weekly_pulse()
@@ -101,15 +116,27 @@ def get_project_pulse_detail(project_code: str, weeks: int = RECENT_WEEKS) -> di
         "window_weeks": weeks,
     }
 
-def get_employee_pulse_table(weeks: int = RECENT_WEEKS) -> pd.DataFrame:
-    """One row per employee_id -- Wellbeing's "Not happy" signal, separate
-    from the existing timesheet-hours burnout flag."""
+def get_employee_pulse_table(weeks: int = RECENT_WEEKS, top_n: int = NOT_HAPPY_TOP_N) -> pd.DataFrame:
+    """One row per employee_id with any real response in the window --
+    Wellbeing's "Not happy" signal, separate from the existing timesheet-hours
+    burnout flag. is_not_happy marks only the top_n most severe real cases
+    (see NOT_HAPPY_TOP_N's docstring for why this is ranked, not a fixed
+    share/count threshold) -- ranked by real bad-response count, then by real
+    average NOT_HAPPY_QUESTIONS score as a tiebreaker."""
     recent = _recent_pulse(weeks)
     if recent.empty:
-        return pd.DataFrame(columns=["is_not_happy"])
+        return pd.DataFrame(columns=["is_not_happy", "bad_response_count", "avg_not_happy_score"])
     recent = recent.assign(_is_bad=_is_bad_row(recent))
-    is_not_happy = recent.groupby("employee_id")["_is_bad"].any().rename("is_not_happy")
-    return is_not_happy.to_frame()
+    grouped = recent.groupby("employee_id")
+    bad_response_count = grouped["_is_bad"].sum().rename("bad_response_count")
+    avg_not_happy_score = grouped[NOT_HAPPY_QUESTIONS].mean().mean(axis=1).round(2).rename("avg_not_happy_score")
+    table = pd.concat([bad_response_count, avg_not_happy_score], axis=1)
+    candidates = table[table["bad_response_count"] > 0].sort_values(
+        ["bad_response_count", "avg_not_happy_score"], ascending=[False, True]
+    )
+    top_ids = set(candidates.head(top_n).index)
+    table["is_not_happy"] = table.index.isin(top_ids)
+    return table
 
 def get_employee_all_pulse_responses(employee_id: str) -> list[dict]:
     """Every real weekly pulse response this employee has ever submitted --

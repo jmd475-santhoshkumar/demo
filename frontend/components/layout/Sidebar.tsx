@@ -358,7 +358,8 @@ export function Sidebar() {
           <div className="px-3 min-h-14 flex items-center gap-2">
             {showExpanded ? (
               <Link href="/dashboard" className="flex-1 flex flex-col items-stretch justify-center min-w-0 py-4 gap-0 pl-3 pr-3 px-3">
-                <Image src="/jman_logo.svg" alt="JMAN" width={80} height={20} className="h-5 w-auto object-contain mt-1" />
+                <Image src="/jman_logo.svg" alt="JMAN" width={80} height={20} className="h-5 w-auto object-contain mt-1 dark:hidden" />
+                <Image src="/jman_logo_white.png" alt="JMAN" width={80} height={20} className="h-5 w-auto object-contain mt-1 hidden dark:block" />
                 <span className="leading-none select-none w-full text-right -mt-0.5 pr-10">
                   <span className="text-[14px] font-serif font-bold text-sidebar-foreground">Resource</span>
                   <span className="text-[12px] font-mono font-normal" style={{ color: "hsl(var(--primary))" }}>IQ</span>

@@ -16,20 +16,25 @@ from app.services.allocation_report_service import NOT_A_REAL_PROJECT_TYPES
 # pipeline/sales states, not evidence the employee actually did the work.
 REAL_STATUSES = frozenset({"COMPLETE", "ACTIVE"})
 
-# Internal work is discretionary, not client delivery -- consistent with how
-# availability_as_of() in recommendation_service.py already excludes it from
-# "busy" capacity. It still counts toward total_projects (breadth/tenure) but
-# never toward category-relevance matching.
+# Internal work (governance/pricing/internal-product buckets) is discretionary,
+# not client delivery -- consistent with how availability_as_of() in
+# recommendation_service.py already excludes it from "busy" capacity. Excluded
+# everywhere in this module, including total_projects: an RM reading an
+# employee's track record found internal-only work inflating "N projects" into
+# a misleading breadth signal (e.g. a genuine ~9-client-project employee
+# showing as "22 projects" once internal buckets were counted alongside real
+# client engagements).
 INTERNAL_PROJECT_TYPE = "Internal Project"
 
 # BAU Activity / Sales Activity are NOT real projects at all (internal
 # timesheet buckets -- confirmed ~987 headcount logged against each real one,
 # essentially the whole company; see allocation_report_service.py's own
-# definition of this set). Unlike INTERNAL_PROJECT_TYPE above, these are
-# excluded everywhere in this module, including total_projects/distinct_clients
-# -- without this, "N projects" on an employee's track record silently counted
-# dozens of these evergreen (2030+ end date) internal buckets as real delivery
-# history, e.g. a genuine ~9-project employee showing as "25 projects".
+# definition of this set). Excluded everywhere in this module, including
+# total_projects/distinct_clients -- without this, "N projects" on an
+# employee's track record silently counted dozens of these evergreen (2030+
+# end date) internal buckets as real delivery history, e.g. a genuine
+# ~9-project employee showing as "25 projects".
+NON_DELIVERY_EXPERIENCE_TYPES = NOT_A_REAL_PROJECT_TYPES | {INTERNAL_PROJECT_TYPE}
 
 UNTAGGED_VALUES = frozenset({"", "nan", "not_mapped", "none"})
 
@@ -91,8 +96,8 @@ def build_employee_experience_profiles() -> dict[str, dict]:
     """One profile per employee who has ≥1 real (COMPLETE/ACTIVE) project.
 
     Each profile:
-      total_projects: int -- distinct real project_code count (any type, breadth signal)
-      distinct_clients: int -- distinct client_id across client-facing real projects
+      total_projects: int -- distinct real, client-facing project_code count (breadth signal)
+      distinct_clients: int -- distinct client_id across those same client-facing real projects
       proposition_breakdown: dict[str, float] -- recency-weighted count per proposition_coe label
       tech_coe_breakdown: dict[str, float] -- recency-weighted count per tech_coe label
     Employees with zero real project history are simply absent from the dict --
@@ -115,7 +120,7 @@ def build_employee_experience_profiles() -> dict[str, dict]:
         projects[proj_cols], left_on="project_id", right_on="project_code", how="inner"
     )
     real = merged[
-        merged["project_status"].isin(REAL_STATUSES) & ~merged["type_of_project"].isin(NOT_A_REAL_PROJECT_TYPES)
+        merged["project_status"].isin(REAL_STATUSES) & ~merged["type_of_project"].isin(NON_DELIVERY_EXPERIENCE_TYPES)
     ]
     # Dedup: an employee can have multiple allocation rows against the same project
     # (role/percentage changes mid-project) -- experience is per-project, not per-allocation-row.
@@ -129,22 +134,18 @@ def build_employee_experience_profiles() -> dict[str, dict]:
         ]
     )
 
-    is_client_facing = real["type_of_project"] != INTERNAL_PROJECT_TYPE
-
     profiles: dict[str, dict] = {}
     for emp_id, group in real.groupby("employee_id"):
-        client_facing = group[is_client_facing.loc[group.index]]
-
         proposition_breakdown: dict[str, float] = {}
         tech_coe_breakdown: dict[str, float] = {}
-        for row in client_facing.itertuples(index=False):
+        for row in group.itertuples(index=False):
             w = row.recency_weight
             for label in _split_multi(row.proposition_coe):
                 proposition_breakdown[label] = proposition_breakdown.get(label, 0.0) + w
             for label in _split_multi(row.tech_coe):
                 tech_coe_breakdown[label] = tech_coe_breakdown.get(label, 0.0) + w
 
-        distinct_clients = client_facing.loc[client_facing["client_id"].notna(), "client_id"].nunique()
+        distinct_clients = group.loc[group["client_id"].notna(), "client_id"].nunique()
 
         profiles[emp_id] = {
             "total_projects": int(group["project_code"].nunique()),
@@ -251,7 +252,7 @@ def get_employee_project_history(employee_id: str, category: str | None = None) 
     emp_allocs = allocations.loc[allocations["employee_id"] == employee_id, ["employee_id", "project_id"]]
     merged = emp_allocs.merge(projects[proj_cols], left_on="project_id", right_on="project_code", how="inner")
     real = merged[
-        merged["project_status"].isin(REAL_STATUSES) & ~merged["type_of_project"].isin(NOT_A_REAL_PROJECT_TYPES)
+        merged["project_status"].isin(REAL_STATUSES) & ~merged["type_of_project"].isin(NON_DELIVERY_EXPERIENCE_TYPES)
     ].drop_duplicates(subset=["project_code"])
 
     if category:

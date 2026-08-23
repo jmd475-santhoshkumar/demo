@@ -6,7 +6,6 @@ from app.core.adapter import get_adapter
 from app.engines.employee_coe import get_employee_primary_coe_map
 from app.engines import availability_hold
 from app.engines.pulse_engine import get_employee_pulse_detail
-from app.services.recommendation_service import NON_DELIVERY_ROLES
 from app.services.allocation_report_service import OVER_ALLOCATED_THRESHOLD, UNDER_UTILIZED_THRESHOLD, get_allocation_report
 from app.services.timesheet_insights_service import (
     OVERTIME_DAILY_HOURS_THRESHOLD,
@@ -17,6 +16,30 @@ from app.services.timesheet_insights_service import (
 )
 
 _SKILL_SOURCE_RANK = {"observed": 0, "imputed_peer": 1, "imputed_default": 2}
+
+# Real, active designations that are legitimate DELIVERY/billable project
+# roles -- distinct from recommendation_service.NON_DELIVERY_ROLES, which
+# excludes "Partner" too (a Partner isn't a fungible candidate to redeploy
+# into an open seat), but a Partner IS a completely normal role on a project
+# budget line item. Neither department_name (populated for only 4 of 902
+# active employees) nor "ever had a real allocation" (HR/Finance/IT titles
+# get allocated to internal-initiative "projects" too) is a clean enough
+# signal here, so this is a deliberate allowlist -- built from the real,
+# current designation list, kept short and reviewed by hand rather than
+# pattern-matched (e.g. "Partner" vs "TA Partner"/"People Partner" can't be
+# told apart by substring).
+DELIVERY_DESIGNATIONS: frozenset[str] = frozenset(
+    {
+        "Associate Consultant", "Associate Partner", "Consultant", "Contractor",
+        "Graduate Intern", "Intern", "IT Solution Consultant", "Manager",
+        "Operations Associate Consultant", "Partner", "Principal", "Principal Architect",
+        "Principal Consultant", "Principal Data Scientist", "Principal Technology Architect",
+        "Senior Associate Consultant", "Senior Consultant", "Senior Software Engineer",
+        "Senior Solutions Consultant", "Software Engineer", "Solutions Consultant",
+        "Solutions Enabler", "Student", "Technology Solutions Architect",
+        "Trainee Software Engineer", "Undergraduate Intern",
+    }
+)
 
 # employee_id's own letter prefix is the only real signal this data carries
 # for "which region/entity/employment-type this person belongs to" -- JMD/
@@ -73,10 +96,13 @@ def find_employees(query: str, limit: int = 10) -> list[dict]:
         for _, r in matches.iterrows()
     ]
 
-def list_designations() -> list[str]:
+def list_designations(delivery_only: bool = False) -> list[str]:
     employees = get_adapter().get_employees()
     active = employees[employees["account_status"] == 1]
-    return sorted(active["job_name"].dropna().astype(str).str.strip().unique().tolist())
+    names = sorted(active["job_name"].dropna().astype(str).str.strip().unique().tolist())
+    if delivery_only:
+        names = [n for n in names if n in DELIVERY_DESIGNATIONS]
+    return names
 
 def list_employees() -> list[dict]:
     employees = get_adapter().get_employees()
@@ -139,13 +165,14 @@ def get_employee_headcount_summary() -> dict:
     already_departed = resignation.notna() & (resignation <= today)
     in_notice_period = resignation.notna() & (resignation > today)
 
-    delivery_mask = ~employees["job_name"].isin(NON_DELIVERY_ROLES)
-    delivery_employees = employees[delivery_mask]
-    delivery_departed = (
-        delivery_employees["date_of_resignation"].notna()
-        & (delivery_employees["date_of_resignation"] <= today)
-    )
-    delivery_active = int((~delivery_departed).sum())
+    # "Delivery Staff" on the Dashboard means the real JMD entity specifically
+    # (confirmed with the Resource Manager: JMD is the ~600-700 headcount figure
+    # they expect for this card -- see _employee_group's docstring on what each
+    # employee_id prefix represents), not a job-title-based delivery/non-delivery
+    # split -- that's a different, unrelated concept (DELIVERY_DESIGNATIONS,
+    # used for the Budget Creation role dropdown, not headcount reporting).
+    is_jmd = employees["employee_id"].astype(str).str.startswith("JMD")
+    delivery_active = int((is_jmd & ~already_departed & ~in_notice_period).sum())
 
     # Simple "no job title on record" tally -- the old account_status==0-based
     # ghost-row heuristic no longer applies now that account_status is purely
