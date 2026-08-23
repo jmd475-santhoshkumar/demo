@@ -1,0 +1,17 @@
+# LOCAL DEV ONLY -- auto-applied by `docker compose up`, gitignored, never
+# deployed. Exists for one reason: this checkout lives on a Windows drive
+# (/mnt/c inside WSL), and Postgres refuses to initialise a cluster there --
+# initdb cannot chmod the data directory to 0700 on drvfs:
+#   initdb: error: could not change permissions of directory
+#           "/var/lib/postgresql/data": Operation not permitted
+# So locally the cluster lives in a Docker-managed named volume instead of
+# the ./db/data bind mount. ./db/init is still mounted (read-only reads are
+# fine on drvfs). Delete this file to get the production layout back.
+services:
+  postgres:
+    volumes:
+      - resourceiq_pgdata:/var/lib/postgresql/data
+
+volumes:
+  resourceiq_pgdata:
+

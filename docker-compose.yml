@@ -1,83 +1,123 @@
-# ResourceIQ -- full stack for a single EC2 host (Postgres + FastAPI + Next.js).
-# Postgres runs as a container here, with its data bind-mounted to ./db/data.
-# To use RDS instead, just point DATABASE_URL at the RDS endpoint.
+# ResourceIQ -- full stack for a single EC2 host
+# Postgres + FastAPI + Next.js
 #
-#   cd ResourceIQ
-#   cp .env.example .env      # then fill in the real secrets
-#   docker compose up -d --build
+# Current architecture:
 #
-# Frontend is published on :80, backend on :8000. The frontend proxies
-# /api/* to the backend over the internal compose network (next.config.js
-# rewrites), so browsers only ever need :80 -- :8000 is exposed purely for
-# direct API calls / debugging and can be dropped from the security group.
+#   Internet
+#       |
+#       v
+#   ALB :80
+#       |
+#       v
+#   EC2 :80
+#       |
+#       v
+#   Frontend container :3000
+#       |
+#       | /api/* via Next.js rewrite
+#       v
+#   Backend container :8000
+#       |
+#       v
+#   PostgreSQL :5432
 #
-# Sizing note: the backend image bundles CPU torch + all-MiniLM-L6-v2 and
-# warms the embedding index into RAM on startup. Use t3.large (8 GB) or
-# bigger; t3.micro/small will OOM during the build and at warmup.
+# PostgreSQL is not exposed outside Docker.
+# Backend port 8000 is exposed on the EC2 for debugging.
+# Frontend is exposed on EC2 port 80.
 
 services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # PostgreSQL
+  # ──────────────────────────────────────────────────────────────────────────
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+
     environment:
-      # Set these in .env -- the container creates this role/database on its
-      # FIRST start only. Changing them later does nothing unless you also
-      # wipe ./db/data, so get them right before the first "up".
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
-    # Not published to the host: only the backend reaches it, over the
-    # internal compose network. Keep 5432 out of the EC2 security group.
-    # Uncomment only if you need psql/pgAdmin from outside the instance.
+
+    # PostgreSQL is NOT exposed on the EC2 host.
+    # Only the backend container connects to PostgreSQL.
+    #
     # ports:
     #   - "5432:5432"
+
     volumes:
-      # Bind mount, not a named volume -- the data sits in ./db/data next to
-      # the compose file so it is easy to find, back up and scp off the box.
       - ./db/data:/var/lib/postgresql/data
-      # Any .sql/.sh dropped in ./db/init runs ONCE, on first init only
-      # (ignored entirely if ./db/data is already populated).
       - ./db/init:/docker-entrypoint-initdb.d:ro
+
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+        ]
       interval: 5s
       timeout: 5s
       retries: 10
+
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
 
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # FastAPI Backend
+  # ──────────────────────────────────────────────────────────────────────────
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+
     restart: unless-stopped
+
     depends_on:
       postgres:
         condition: service_healthy
+
     ports:
+      # EC2:8000 -> Container:8000
+      #
+      # This is optional for debugging.
+      # You don't need ALB traffic to use this port.
       - "8000:8000"
+
     environment:
-      # ── database ──────────────────────────────────────────────────────────
-      # Points at the postgres service above (host = "postgres").
-      # Swap the host for an RDS endpoint to use RDS instead --
-      # nothing else about the app changes.
+
+      # ── Database ──────────────────────────────────────────────────────────
+
+      # IMPORTANT:
+      # "postgres" is the Docker Compose service name.
+      # Do NOT use localhost here.
+
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env}
 
-      # ── networking / CORS ─────────────────────────────────────────────────
-      # Must list the exact origin the browser loads the app from, e.g.
-      # http://<ec2-public-ip> or https://resourceiq.example.com
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
-      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
 
-      # ── data source mode (app/core/adapter.py) ────────────────────────────
+      # ── CORS / Frontend ──────────────────────────────────────────────────
+
+      # Current public application URL is the ALB.
+
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://alb-resouce-iq-949735300.ap-south-2.elb.amazonaws.com}
+
+      FRONTEND_URL: ${FRONTEND_URL:-http://alb-resouce-iq-949735300.ap-south-2.elb.amazonaws.com}
+
+
+      # ── Data source ──────────────────────────────────────────────────────
+
       DATA_SOURCE_MODE: ${DATA_SOURCE_MODE:-local}
       JIN_API_BASE_URL: ${JIN_API_BASE_URL:-}
       JIN_API_KEY: ${JIN_API_KEY:-}
 
-      # ── email / digest (app/services/email_service.py) ────────────────────
+
+      # ── Email / Digest ───────────────────────────────────────────────────
+
       MAILTRAP_HOST: ${MAILTRAP_HOST:-}
       MAILTRAP_PORT: ${MAILTRAP_PORT:-2525}
       MAILTRAP_USERNAME: ${MAILTRAP_USERNAME:-}
@@ -86,84 +126,135 @@ services:
       MAILTRAP_FROM_NAME: ${MAILTRAP_FROM_NAME:-ResourceIQ}
       DIGEST_RECIPIENT_EMAIL: ${DIGEST_RECIPIENT_EMAIL:-}
 
-      # ── vector store (app/engines/embedding_engine.py) ────────────────────
+
+      # ── Vector Store ─────────────────────────────────────────────────────
+
       PINECONE_API_KEY: ${PINECONE_API_KEY:-}
       PINECONE_HOST: ${PINECONE_HOST:-}
 
-      # ── Azure DevOps insights (app/services/devops_insights_service.py) ───
-      # An empty PAT cleanly disables the whole DevOps feature.
+
+      # ── Azure DevOps ────────────────────────────────────────────────────
+
       AZURE_DEVOPS_ORG: ${AZURE_DEVOPS_ORG:-}
       AZURE_DEVOPS_PROJECT: ${AZURE_DEVOPS_PROJECT:-}
       AZURE_DEVOPS_TEAM: ${AZURE_DEVOPS_TEAM:-}
       AZURE_DEVOPS_PAT: ${AZURE_DEVOPS_PAT:-}
 
-      # ── LLM providers (app/ai/llm.py picks the first one configured) ──────
+
+      # ── LLM Providers ────────────────────────────────────────────────────
+
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
       AZURE_OPENAI_MODEL: ${AZURE_OPENAI_MODEL:-gpt-4o}
+
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
 
-      # ── Entra ID SSO (app/core/auth_config.py) ────────────────────────────
-      # All four blank => is_configured() is False and auth fully no-ops.
+
+      # ── Entra ID SSO ─────────────────────────────────────────────────────
+
       AZURE_AD_TENANT_ID: ${AZURE_AD_TENANT_ID:-}
       AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID:-}
       AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET:-}
       AZURE_AD_REDIRECT_URI: ${AZURE_AD_REDIRECT_URI:-}
-      # Leave blank and a random key is generated per process -- which logs
-      # everyone out on every restart. Set it for a real deployment.
+
       SESSION_SECRET_KEY: ${SESSION_SECRET_KEY:-}
 
-      # ── S3 attachment uploads (app/services/s3_upload_service.py) ─────────
+
+      # ── S3 ───────────────────────────────────────────────────────────────
+
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_REGION: ${AWS_REGION:-eu-north-1}
       S3_ATTACHMENTS_BUCKET: ${S3_ATTACHMENTS_BUCKET:-}
 
-      # ── model weights are baked into the image; never fetch at runtime ────
+
+      # ── Offline ML models ────────────────────────────────────────────────
+
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+
+
     volumes:
-      # Non-dataset app config the app writes at runtime (jdwh connection
-      # profile etc). Everything else lives in Postgres.
+
+      # Application state
       - resourceiq_appstate:/app/backend/data/AppState
-      # Persisted employee embedding vectors -- without this every restart
-      # pays the ~40s cold index rebuild.
+
+      # Embedding cache
       - resourceiq_embedding_cache:/app/backend/.embedding_cache
+
+
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
 
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Next.js Frontend
+  # ──────────────────────────────────────────────────────────────────────────
+
   frontend:
+
     build:
       context: ./frontend
       dockerfile: Dockerfile
+
+      # IMPORTANT:
+      # Only ONE args block.
+      #
+      # BACKEND_URL is required during the Next.js build because
+      # next.config.js rewrites() is evaluated during npm run build.
+
       args:
-        # Baked into the build -- see the note in frontend/Dockerfile. Override
-        # only if the backend is not the compose service next to this one.
         BACKEND_URL: ${BACKEND_URL:-http://backend:8000}
+
+
     restart: unless-stopped
+
+
     depends_on:
       backend:
         condition: service_healthy
+
+
     ports:
+      # EC2 port 80
+      #        ↓
+      # Frontend container port 3000
+      #
+      # ALB sends HTTP:80 to EC2:80.
+
       - "80:3000"
+
+
     environment:
-      # Kept in step with the build arg above so anything reading it at runtime
-      # (server components, route handlers) agrees with the baked rewrite.
+
+      # Runtime backend service name inside Docker network.
       BACKEND_URL: http://backend:8000
+
       NODE_ENV: production
+
       PORT: "3000"
+
       HOSTNAME: "0.0.0.0"
+
+
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
 
+
+# ────────────────────────────────────────────────────────────────────────────
+# Named volumes
+# ────────────────────────────────────────────────────────────────────────────
+
 volumes:
+
   resourceiq_appstate:
+
   resourceiq_embedding_cache:
