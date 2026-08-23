@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: resourceiq-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sanity-check the built image imports cleanly
+        run: |
+          docker run --rm resourceiq-backend:ci \
+            python -c "import app.main; print('app.main imported OK,', len(app.main.app.routes), 'routes')"

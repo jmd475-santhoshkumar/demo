@@ -1,0 +1,324 @@
+import re
+
+import pandas as pd
+
+from app.core.adapter import get_adapter
+from app.engines.employee_coe import get_employee_primary_coe_map
+from app.engines import availability_hold
+from app.engines.pulse_engine import get_employee_pulse_detail
+from app.services.recommendation_service import NON_DELIVERY_ROLES
+from app.services.allocation_report_service import OVER_ALLOCATED_THRESHOLD, UNDER_UTILIZED_THRESHOLD, get_allocation_report
+from app.services.timesheet_insights_service import (
+    OVERTIME_DAILY_HOURS_THRESHOLD,
+    SUSTAINED_OVERTIME_MIN_DAYS,
+    SUSTAINED_OVERTIME_WINDOW_DAYS,
+    get_employee_overtime_risk,
+    get_employee_recent_daily_hours,
+)
+
+_SKILL_SOURCE_RANK = {"observed": 0, "imputed_peer": 1, "imputed_default": 2}
+
+# employee_id's own letter prefix is the only real signal this data carries
+# for "which region/entity/employment-type this person belongs to" -- JMD/
+# JMG/JML/JMU are real distinct organizational groups (all genuine
+# employees, per the Resource Manager -- JMD alone is the ~600-700 headcount
+# figure they expect, JMG/JML/JMU are other real regions/entities); INT/TRN/
+# EXT are employment-TYPE categories, not permanent entities (confirmed:
+# interns (INT) convert to JMD in Chennai once they go full-time -- this is a
+# transitional label, not another office). Shown as a filter, not used to
+# exclude anyone from the Total count -- every real prefix here is a real
+# employee somewhere in the org.
+_EMPLOYEE_GROUP_LABELS = {
+    "JMD": "JMD", "JMG": "JMG", "JML": "JML", "JMU": "JMU",
+    "INT": "Intern (pre-conversion)", "TRN": "Trainee", "EXT": "External/Contractor",
+    "CRN": "CRN",
+}
+_EMPLOYEE_ID_PREFIX_RE = re.compile(r"^([A-Za-z]+)")
+
+def _employee_group(employee_id: str | None) -> str:
+    if not employee_id:
+        return "Other"
+    match = _EMPLOYEE_ID_PREFIX_RE.match(employee_id)
+    prefix = match.group(1) if match else None
+    return _EMPLOYEE_GROUP_LABELS.get(prefix, prefix or "Other")
+
+def list_employee_groups() -> list[str]:
+    employees = get_adapter().get_employees()
+    groups = employees["employee_id"].map(_employee_group)
+    return sorted(groups.unique().tolist())
+
+class EmployeeNotFound(Exception):
+
+    def __init__(self, employee_id: str):
+        self.employee_id = employee_id
+        super().__init__(f"employee_id {employee_id!r} not found")
+
+def find_employees(query: str, limit: int = 10) -> list[dict]:
+    employees = get_adapter().get_employees()
+    q = query.strip().lower()
+    if not q:
+        return []
+    cols = ["employee_id", "job_name", "department_name", "location"]
+    mask = pd.Series(False, index=employees.index)
+    for col in cols:
+        mask |= employees[col].astype(str).str.lower().str.contains(q, na=False, regex=False)
+    matches = employees[mask].head(limit)
+    return [
+        {
+            "employee_id": r["employee_id"],
+            "job_name": r.get("job_name") if pd.notna(r.get("job_name")) else None,
+            "department_name": r.get("department_name") if pd.notna(r.get("department_name")) else None,
+            "location": r.get("location") if pd.notna(r.get("location")) else None,
+        }
+        for _, r in matches.iterrows()
+    ]
+
+def list_designations() -> list[str]:
+    employees = get_adapter().get_employees()
+    active = employees[employees["account_status"] == 1]
+    return sorted(active["job_name"].dropna().astype(str).str.strip().unique().tolist())
+
+def list_employees() -> list[dict]:
+    employees = get_adapter().get_employees()
+    today = pd.Timestamp.now().normalize()
+    coe_map = get_employee_primary_coe_map()
+    # Client-project allocation only, not the raw total -- someone can be
+    # legitimately, simultaneously attached to many internal/BAU overhead
+    # buckets (confirmed against real data: one real employee had 13 such
+    # concurrent 100% internal allocations), which would make this look like
+    # a nonsensical >1000% workload if summed in with real client staffing.
+    alloc_pct_by_emp = {r["employee_id"]: r["employee_client_allocation_pct"] for r in get_allocation_report()}
+    hold_flags = availability_hold.get_employee_hold_flags()
+
+    # No account_status filter here -- this endpoint's own job is to show
+    # everyone "ever on roster" and categorize each into active/notice_period/
+    # departed from date_of_resignation. account_status now mirrors that same
+    # resignation-based signal (see adapter.get_employees()), so filtering on
+    # it here would drop every departed row before the loop below ever gets a
+    # chance to label it "departed" -- confirmed this was silently zeroing out
+    # the Departed count entirely despite real resignation data existing.
+    out = []
+    for _, r in employees.iterrows():
+        resignation = r.get("date_of_resignation")
+        if pd.notna(resignation) and resignation <= today:
+            status = "departed"
+        elif pd.notna(resignation):
+            status = "notice_period"
+        else:
+            status = "active"
+        emp_id = r["employee_id"]
+        out.append(
+            {
+                "employee_id": emp_id,
+                "employee_full_name": r.get("employee_full_name") if pd.notna(r.get("employee_full_name")) else None,
+                "job_name": r.get("job_name") if pd.notna(r.get("job_name")) else None,
+                "department_name": r.get("department_name") if pd.notna(r.get("department_name")) else None,
+                "location": r.get("location") if pd.notna(r.get("location")) else None,
+                "manager_employee_id": r.get("manager_employee_id") if pd.notna(r.get("manager_employee_id")) else None,
+                "date_of_join": r["date_of_join"].strftime("%Y-%m-%d") if pd.notna(r.get("date_of_join")) else None,
+                "date_of_resignation": r["date_of_resignation"].strftime("%Y-%m-%d") if pd.notna(r.get("date_of_resignation")) else None,
+                "status": status,
+                "coe": coe_map.get(emp_id),
+                "employee_group": _employee_group(emp_id),
+                "current_allocation_pct": alloc_pct_by_emp.get(emp_id),
+                "on_hold": emp_id in hold_flags,
+                "hold_projects": hold_flags.get(emp_id, {}).get("projects", []),
+            }
+        )
+    return out
+
+def get_employee_headcount_summary() -> dict:
+    employees = get_adapter().get_employees()
+    today = pd.Timestamp.now().normalize()
+
+    # Everyone ever on roster, not just account_status==1 -- account_status is
+    # now itself derived from date_of_resignation (see adapter.get_employees()),
+    # so pre-filtering on it here would exclude every departed row before
+    # already_departed/in_notice_period below ever get a chance to count them.
+    resignation = employees["date_of_resignation"]
+    already_departed = resignation.notna() & (resignation <= today)
+    in_notice_period = resignation.notna() & (resignation > today)
+
+    delivery_mask = ~employees["job_name"].isin(NON_DELIVERY_ROLES)
+    delivery_employees = employees[delivery_mask]
+    delivery_departed = (
+        delivery_employees["date_of_resignation"].notna()
+        & (delivery_employees["date_of_resignation"] <= today)
+    )
+    delivery_active = int((~delivery_departed).sum())
+
+    # Simple "no job title on record" tally -- the old account_status==0-based
+    # ghost-row heuristic no longer applies now that account_status is purely
+    # resignation-derived; real junk/placeholder rows are already dropped
+    # upstream in jdwh_table_mapping.map_employee_table.
+    ghost_rows = int(employees["job_name"].isna().sum())
+
+    return {
+        "total_ever": int(len(employees)),
+        "currently_active": int((~already_departed & ~in_notice_period).sum()),
+        "delivery_active": delivery_active,
+        "already_departed": int(already_departed.sum()),
+        "in_notice_period": int(in_notice_period.sum()),
+        "ghost_records": ghost_rows,
+    }
+
+def get_overtime_risk_summary() -> dict:
+    employees = get_adapter().get_employees()
+    active = employees[employees["account_status"] == 1]
+    job_name_by_id = active.set_index("employee_id")["job_name"].to_dict()
+    risk = get_employee_overtime_risk()
+    at_risk = [
+        {
+            "employee_id": emp_id,
+            "job_name": job_name_by_id.get(emp_id) if pd.notna(job_name_by_id.get(emp_id)) else None,
+            "overtime_days_recent": r["overtime_days_recent"],
+            "max_daily_hours_recent": r["max_daily_hours_recent"],
+        }
+        for emp_id, r in risk.items()
+        if r["is_sustained_overtime"] and emp_id in job_name_by_id
+    ]
+    at_risk.sort(key=lambda r: -r["overtime_days_recent"])
+    return {
+        "employees_at_risk": len(at_risk),
+        "threshold_days": SUSTAINED_OVERTIME_MIN_DAYS,
+        "window_days": SUSTAINED_OVERTIME_WINDOW_DAYS,
+        "daily_hours_threshold": OVERTIME_DAILY_HOURS_THRESHOLD,
+        "employees": at_risk,
+    }
+
+def skills_for(employee_id: str, skills: pd.DataFrame) -> list[dict]:
+    rows = skills[skills["employee_id"] == employee_id].copy()
+    rows["_source_rank"] = rows["skill_source"].map(_SKILL_SOURCE_RANK).fillna(9)
+    rows = rows.sort_values(["_source_rank", "score"], ascending=[True, False])
+
+    out = []
+    for _, r in rows.iterrows():
+        out.append(
+            {
+                "coe": r.get("coe") if pd.notna(r.get("coe")) else None,
+                "coe_skill": r.get("coe_skill") if pd.notna(r.get("coe_skill")) else None,
+                "skill": r.get("skill") if pd.notna(r.get("skill")) else None,
+                "subskill": r.get("subskill") if pd.notna(r.get("subskill")) else None,
+                "experience": r.get("experience") if pd.notna(r.get("experience")) else None,
+                "score": float(r["score"]) if pd.notna(r["score"]) else None,
+                "skill_source": r["skill_source"],
+            }
+        )
+    return out
+
+def _competencies_for(employee_id: str, competencies: pd.DataFrame) -> list[dict]:
+    rows = competencies[competencies["employee_id"] == employee_id].sort_values("score", ascending=False)
+    out = []
+    for _, r in rows.iterrows():
+        out.append(
+            {
+                "competency_sheet": r.get("competency_sheet") if pd.notna(r.get("competency_sheet")) else None,
+                "competency_question": r.get("competency_question") if pd.notna(r.get("competency_question")) else None,
+                "response": r.get("response") if pd.notna(r.get("response")) else None,
+                "score": float(r["score"]) if pd.notna(r["score"]) else None,
+                "competency_source": r["competency_source"],
+            }
+        )
+    return out
+
+def _allocations_for(employee_id: str, allocations: pd.DataFrame, projects: pd.DataFrame) -> list[dict]:
+    rows = allocations[allocations["employee_id"] == employee_id].merge(
+        projects[["project_code", "client_id", "type_of_project", "project_status"]],
+        left_on="project_id", right_on="project_code", how="left",
+    )
+    rows = rows.sort_values(["is_allocation_active", "allocated_start_date"], ascending=[False, False])
+
+    out = []
+    for _, r in rows.iterrows():
+        out.append(
+            {
+                "project_id": r["project_id"],
+                "client_id": r.get("client_id") if pd.notna(r.get("client_id")) else None,
+                "type_of_project": r.get("type_of_project") if pd.notna(r.get("type_of_project")) else None,
+                "project_status": r.get("project_status") if pd.notna(r.get("project_status")) else None,
+                "resourcing_status": r["resourcing_status"],
+                "allocation_by_percentage": float(r["allocation_by_percentage"]) if pd.notna(r["allocation_by_percentage"]) else None,
+                "allocated_start_date": r["allocated_start_date"].strftime("%Y-%m-%d") if pd.notna(r["allocated_start_date"]) else None,
+                "allocated_end_date": r["allocated_end_date"].strftime("%Y-%m-%d") if pd.notna(r["allocated_end_date"]) else None,
+                "is_allocation_active": bool(r["is_allocation_active"]),
+            }
+        )
+    return out
+
+def _leaves_for(employee_id: str, leaves: pd.DataFrame) -> list[dict]:
+    rows = leaves[leaves["employee_id"] == employee_id].sort_values("leave_start_date", ascending=False)
+    today = pd.Timestamp.now().normalize()
+    out = []
+    for _, r in rows.iterrows():
+        out.append(
+            {
+                "leave_type": r["leave_type"],
+                "leave_start_date": r["leave_start_date"].strftime("%Y-%m-%d") if pd.notna(r["leave_start_date"]) else None,
+                "leave_end_date": r["leave_end_date"].strftime("%Y-%m-%d") if pd.notna(r["leave_end_date"]) else None,
+                "status": r["status"],
+                "source": r["source"],
+                "is_currently_on_leave": bool(pd.notna(r["leave_start_date"]) and pd.notna(r["leave_end_date"]) and r["leave_start_date"] <= today <= r["leave_end_date"]),
+            }
+        )
+    return out
+
+def get_employee_profile(employee_id: str) -> dict:
+    adapter = get_adapter()
+    employees = adapter.get_employees()
+
+    match = employees[employees["employee_id"] == employee_id]
+    if match.empty:
+        raise EmployeeNotFound(employee_id)
+    employee_row = match.iloc[0]
+
+    coe_map = get_employee_primary_coe_map()
+    current_allocations = [r for r in get_allocation_report() if r["employee_id"] == employee_id]
+    employee_total_allocation_pct = current_allocations[0]["employee_total_allocation_pct"] if current_allocations else None
+    employee_client_allocation_pct = current_allocations[0]["employee_client_allocation_pct"] if current_allocations else None
+    employee_internal_allocation_pct = current_allocations[0]["employee_internal_allocation_pct"] if current_allocations else None
+    overtime_risk = get_employee_overtime_risk().get(
+        employee_id, {"overtime_days_recent": 0, "max_daily_hours_recent": 0.0, "is_sustained_overtime": False}
+    )
+    hold_info = availability_hold.get_employee_hold_flags().get(employee_id)
+
+    signals = {
+        "on_hold": hold_info is not None,
+        "hold_projects": hold_info["projects"] if hold_info else [],
+        # Judged on client-only allocation -- internal-project work is discretionary
+        # ("contribute when you have time"), not a hard commitment, so it never makes
+        # someone look over capacity on its own.
+        "over_allocated": bool(employee_client_allocation_pct is not None and employee_client_allocation_pct > OVER_ALLOCATED_THRESHOLD),
+        "over_allocated_threshold": OVER_ALLOCATED_THRESHOLD,
+        "over_allocated_due_to_internal": bool(current_allocations[0]["over_allocated_due_to_internal"]) if current_allocations else False,
+        "under_utilized": bool(employee_total_allocation_pct is not None and employee_total_allocation_pct < UNDER_UTILIZED_THRESHOLD),
+        "under_utilized_threshold": UNDER_UTILIZED_THRESHOLD,
+        "sustained_overtime": bool(overtime_risk["is_sustained_overtime"]),
+        "overtime_daily_threshold_hours": OVERTIME_DAILY_HOURS_THRESHOLD,
+        "overtime_sustained_min_days": SUSTAINED_OVERTIME_MIN_DAYS,
+        "overtime_window_days": SUSTAINED_OVERTIME_WINDOW_DAYS,
+        "possible_unplanned_absence": any(r["possible_unplanned_absence"] for r in current_allocations),
+    }
+
+    return {
+        "employee_id": employee_id,
+        "employee_full_name": employee_row.get("employee_full_name") if pd.notna(employee_row.get("employee_full_name")) else None,
+        "job_name": employee_row.get("job_name") if pd.notna(employee_row.get("job_name")) else None,
+        "department_name": employee_row.get("department_name") if pd.notna(employee_row.get("department_name")) else None,
+        "location": employee_row.get("location") if pd.notna(employee_row.get("location")) else None,
+        "date_of_join": employee_row["date_of_join"].strftime("%Y-%m-%d") if pd.notna(employee_row.get("date_of_join")) else None,
+        "account_status": bool(employee_row["account_status"]) if pd.notna(employee_row.get("account_status")) else None,
+        "coe": coe_map.get(employee_id),
+        "manager_employee_id": employee_row.get("manager_employee_id") if pd.notna(employee_row.get("manager_employee_id")) else None,
+        "employee_total_allocation_pct": employee_total_allocation_pct,
+        "employee_client_allocation_pct": employee_client_allocation_pct,
+        "employee_internal_allocation_pct": employee_internal_allocation_pct,
+        "skills": skills_for(employee_id, adapter.get_skills()),
+        "competencies": _competencies_for(employee_id, adapter.get_competencies()),
+        "allocations": _allocations_for(employee_id, adapter.get_allocations(), adapter.get_projects()),
+        "current_allocations": current_allocations,
+        "overtime_risk": overtime_risk,
+        "daily_hours_recent": get_employee_recent_daily_hours(employee_id),
+        "leaves": _leaves_for(employee_id, adapter.get_leaves()),
+        "signals": signals,
+        "pulse": get_employee_pulse_detail(employee_id),
+    }

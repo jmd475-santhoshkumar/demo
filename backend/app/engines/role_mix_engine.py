@@ -1,0 +1,266 @@
+
+import pandas as pd
+
+from app.core.adapter import get_adapter
+
+DND_TACTICAL_BUILD = "D&D Tactical Build"
+DELIVERY_STANDARD_TEAM = "Delivery Project - Standard Team"
+
+_DND_TEMPLATE = {
+    "Principal": 0.25,
+    "Technical Solutions Architect": 0.25,
+    "Associate Consultant": 1.0,
+    "Consultant": 0.5,
+    "Senior Solutions Consultant": 0.5,
+    "Senior Software Engineer": 1.0,
+}
+
+# Real RM-provided team template for a typical DELIVERY project (~5 weeks,
+# ~$35k revenue -- see app/engines/revenue_engine.py's DELIVERY_TEMPLATE for
+# the duration/revenue side of this same template). 2 engineer seats use
+# Senior Software Engineer as the canonical designation; Software Engineer
+# fills either seat via the existing adjacent-title fallback in
+# demand_forecast_service.py. Same for Consultant/Senior Consultant.
+_DELIVERY_TEMPLATE = {
+    "Senior Software Engineer": 2.0,
+    "Solutions Enabler": 1.0,
+    "Consultant": 1.0,
+}
+
+# docx-given (not derived-from-real-data) templates, keyed by their DOCX_CATEGORY_MAP name.
+_DOCX_TEMPLATES: dict[str, dict[str, float]] = {
+    DND_TACTICAL_BUILD: _DND_TEMPLATE,
+    DELIVERY_STANDARD_TEAM: _DELIVERY_TEMPLATE,
+}
+
+DOCX_CATEGORY_MAP: dict[str, dict] = {
+    DND_TACTICAL_BUILD: {"docx_given": True},
+    DELIVERY_STANDARD_TEAM: {"docx_given": True},
+    "Build Phase - Tactical Build": {"type_of_project": "Client Project"},
+    "Build Phase - Enterprise Platform Build": {"type_of_project": "Client Project"},
+    "Build Phase - Data Platform Build": {"type_of_project": "Client Project", "tech_coe_any": ["Data Engineering"]},
+    "Data Science Projects": {"type_of_project": "Client Project", "tech_coe_any": ["Data Science", "Data Science & ML"]},
+    "AI Projects": {"type_of_project": "Client Project", "tech_coe_any": ["Gen AI", "Data Science & ML"]},
+    "MS projects": {"type_of_project": "Managed Services"},
+    "Full stack Projects": {"type_of_project": "Client Project", "tech_coe_any": ["Full Stack Engineering"]},
+    "Value creation Projects": {"proposition_coe_any": ["Value Creation"]},
+}
+
+def _primary_coe(tech_coe: str | None) -> str:
+    if not tech_coe or pd.isna(tech_coe):
+        return "Unknown"
+    return str(tech_coe).split(";")[0]
+
+ON_TIME_OVERRUN_GRACE_DAYS = 14
+
+def _tag_on_time(real_projects: pd.DataFrame, allocations: pd.DataFrame) -> pd.DataFrame:
+    max_alloc_end = allocations.groupby("project_id")["allocated_end_date"].max().rename("max_alloc_end")
+    tagged = real_projects.merge(max_alloc_end, left_on="project_code", right_index=True, how="left")
+    overrun_days = (tagged["max_alloc_end"] - tagged["project_end_date"]).dt.days
+    tagged["is_on_time"] = overrun_days.fillna(0) <= ON_TIME_OVERRUN_GRACE_DAYS
+    return tagged
+
+def _real_completed_merged() -> pd.DataFrame:
+    adapter = get_adapter()
+    projects = adapter.get_projects()
+    allocations = adapter.get_allocations()
+    employees = adapter.get_employees()
+
+    real = projects[
+        (projects["date_source"].isin(["given", "derived_allocation"])) & (projects["project_status"] == "COMPLETE")
+    ].copy()
+    real["tech_coe_primary"] = real["tech_coe"].apply(_primary_coe)
+    real = _tag_on_time(real, allocations)
+
+    merged = (
+        real.merge(allocations, left_on="project_code", right_on="project_id")
+        .merge(employees[["employee_id", "job_name"]], on="employee_id", how="left")
+    )
+    merged = merged.dropna(subset=["job_name"])
+    merged["fte"] = merged["allocation_by_percentage"] / 100.0
+    return merged
+
+COMMON_ROLE_PREVALENCE_PCT = 40.0
+
+MIN_ON_TIME_SAMPLE_PROJECTS = 3
+
+def _aggregate_role_mix_preferring_on_time(group: pd.DataFrame) -> dict:
+    on_time = group[group.get("is_on_time", False) == True]  # noqa: E712
+    on_time_n = int(on_time["project_code"].nunique()) if not on_time.empty else 0
+    all_n = int(group["project_code"].nunique())
+
+    if on_time_n >= MIN_ON_TIME_SAMPLE_PROJECTS:
+        result = _aggregate_role_mix_detailed(on_time)
+        result["source"] = "derived_empirical_on_time_preferred"
+    else:
+        result = _aggregate_role_mix_detailed(group)
+
+    result["on_time_sample_size"] = on_time_n
+    result["all_completed_sample_size"] = all_n
+    return result
+
+def _aggregate_role_mix_detailed(group: pd.DataFrame) -> dict:
+    n_projects = group["project_code"].nunique()
+    roles = []
+    role_mix_fte: dict[str, float] = {}
+    for designation, rows in group.groupby("job_name"):
+        n_projects_with_role = rows["project_code"].nunique()
+        prevalence_pct = round(100 * n_projects_with_role / n_projects, 0)
+        # .mode() drops NaN and can come back empty if every real allocation
+        # row for this designation has no percentage at all (a genuine gap in
+        # some real data sources, not just a bad row here or there --
+        # confirmed against the real JIN Data Warehouse's own
+        # allocation_by_percentage column, which came through entirely
+        # unpopulated) -- 100% (full-time) is the most common real-world
+        # allocation by far, so it's the honest default when there's truly no
+        # percentage data to summarize, rather than crashing outright.
+        pct_mode = rows["allocation_by_percentage"].mode()
+        typical_pct = float(pct_mode.iat[0]) if not pct_mode.empty else 100.0
+        heads_per_project = rows.groupby("project_code")["employee_id"].nunique()
+        headcount = max(1, round(heads_per_project.mean()))
+        roles.append(
+            {
+                "designation": designation,
+                "headcount": int(headcount),
+                "typical_pct": typical_pct,
+                "prevalence_pct": prevalence_pct,
+                "common": bool(prevalence_pct >= COMMON_ROLE_PREVALENCE_PCT),
+            }
+        )
+        role_mix_fte[designation] = round(headcount * typical_pct / 100, 2)
+    roles.sort(key=lambda r: -r["prevalence_pct"])
+    expected_headcount_common = sum(r["headcount"] for r in roles if r["common"])
+    return {
+        "roles": roles,
+        "role_mix": role_mix_fte,
+        "expected_headcount_common": expected_headcount_common,
+        "sample_size": int(n_projects),
+        "source": "derived_empirical",
+    }
+
+def _docx_template_to_roles(template: dict[str, float]) -> list[dict]:
+    # fte <= 1.0 is one person at that %; fte > 1.0 (e.g. "2 engineer seats
+    # @ 100% each" = 2.0) needs to split across that many people instead of
+    # reporting it as one person at 200%.
+    roles = []
+    for d, fte in template.items():
+        headcount = max(1, round(fte)) if fte >= 1.0 else 1
+        typical_pct = round(fte / headcount * 100, 1)
+        roles.append({"designation": d, "headcount": headcount, "typical_pct": typical_pct, "prevalence_pct": None, "common": True})
+    return roles
+
+def build_role_mix_templates() -> dict[tuple[str, str], dict]:
+    merged = _real_completed_merged()
+    templates: dict[tuple[str, str], dict] = {}
+    for (type_of_project, coe), group in merged.groupby(["type_of_project", "tech_coe_primary"]):
+        templates[(type_of_project, coe)] = _aggregate_role_mix_preferring_on_time(group)
+    return templates
+
+def get_role_mix_by_category(category: str) -> dict:
+    spec = DOCX_CATEGORY_MAP.get(category)
+    if spec is None:
+        return {"role_mix": {}, "roles": [], "sample_size": 0, "source": "unknown_category"}
+    if spec.get("docx_given"):
+        template = _DOCX_TEMPLATES[category]
+        return {"role_mix": template, "roles": _docx_template_to_roles(template), "sample_size": None, "source": "docx_given"}
+
+    merged = _real_completed_merged()
+    mask = pd.Series(True, index=merged.index)
+    if "type_of_project" in spec:
+        mask &= merged["type_of_project"] == spec["type_of_project"]
+    if "tech_coe_any" in spec:
+        mask &= merged["tech_coe"].fillna("").apply(lambda v: any(k in v for k in spec["tech_coe_any"]))
+    if "proposition_coe_any" in spec:
+        mask &= merged["proposition_coe"].fillna("").apply(lambda v: any(k in v for k in spec["proposition_coe_any"]))
+
+    filtered = merged[mask]
+    if filtered.empty:
+        return {"role_mix": {}, "roles": [], "sample_size": 0, "source": "no_data"}
+    result = _aggregate_role_mix_preferring_on_time(filtered)
+    result["resolved_via"] = spec
+    return result
+
+def list_docx_categories() -> list[dict]:
+    return [{"category": name, **get_role_mix_by_category(name)} for name in DOCX_CATEGORY_MAP]
+
+CANONICAL_COE_MAP: dict[str, list[str]] = {
+    "Data Engineering": ["Data Engineering"],
+    "BI & Reporting": ["BI and Reporting"],
+    "AI & ML": ["Data Science & ML", "Gen AI", "Data Science", "DS/AI", "Software Development and LLMs"],
+    "Full Stack Engineering": ["Full Stack Engineering"],
+    "TechOps & Automation": ["TechOps and Automation", "TechOps And MS"],
+}
+
+def canonical_project_coe(tech_coe: str | None) -> str | None:
+    if not tech_coe or pd.isna(tech_coe):
+        return None
+    v = str(tech_coe)
+    for canonical, aliases in CANONICAL_COE_MAP.items():
+        if any(a in v for a in aliases):
+            return canonical
+    return None
+
+def list_coes() -> list[dict]:
+    real_complete = _real_completed_merged()[["project_code", "tech_coe"]].drop_duplicates("project_code")
+    tech_coe = real_complete["tech_coe"].fillna("")
+    result = []
+    for canonical, raw_aliases in CANONICAL_COE_MAP.items():
+        sample_size = int(tech_coe.apply(lambda v: any(a in v for a in raw_aliases)).sum())
+        result.append({"coe": canonical, "sample_size": sample_size})
+    return sorted(result, key=lambda c: -c["sample_size"])
+
+def get_role_mix_by_coes(coes: list[str], type_of_project: str | None = None) -> dict:
+    if not coes:
+        return {"role_mix": {}, "roles": [], "sample_size": 0, "source": "no_coes_selected", "matched_project_codes": []}
+
+    raw_aliases = [alias for coe in coes for alias in CANONICAL_COE_MAP.get(coe, [coe])]
+    merged = _real_completed_merged()
+    mask = merged["tech_coe"].fillna("").apply(lambda v: any(a in v for a in raw_aliases))
+    if type_of_project:
+        mask &= merged["type_of_project"] == type_of_project
+
+    filtered = merged[mask]
+    if filtered.empty:
+        return {"role_mix": {}, "roles": [], "sample_size": 0, "source": "no_data", "matched_project_codes": []}
+    result = _aggregate_role_mix_preferring_on_time(filtered)
+    result["matched_project_codes"] = sorted(filtered["project_code"].unique().tolist())[:10]
+    return result
+
+def get_role_mix(type_of_project: str, tech_coe: str | None = None, templates: dict | None = None) -> dict:
+    if type_of_project == DND_TACTICAL_BUILD:
+        dnd_roles = _docx_template_to_roles(_DND_TEMPLATE)
+        return {
+            "role_mix": _DND_TEMPLATE,
+            "roles": dnd_roles,
+            "expected_headcount_common": sum(r["headcount"] for r in dnd_roles),
+            "sample_size": None,
+            "source": "docx_given",
+        }
+
+    if templates is None:
+        templates = build_role_mix_templates()
+    coe = _primary_coe(tech_coe)
+
+    if (type_of_project, coe) in templates:
+        return templates[(type_of_project, coe)]
+
+    same_type = [v for (t, _), v in templates.items() if t == type_of_project]
+    if same_type:
+        best = max(same_type, key=lambda v: v["sample_size"])
+        return {**best, "source": "derived_empirical_type_fallback"}
+
+    if templates:
+        best = max(templates.values(), key=lambda v: v["sample_size"])
+        return {**best, "source": "derived_empirical_org_fallback"}
+
+    return {"role_mix": {}, "sample_size": 0, "source": "no_data"}
+
+def list_role_mix_templates() -> list[dict]:
+    templates = build_role_mix_templates()
+    out = [
+        {"type_of_project": name, "tech_coe": None, "role_mix": template, "sample_size": None, "source": "docx_given"}
+        for name, template in _DOCX_TEMPLATES.items()
+    ]
+    for (type_of_project, coe), v in templates.items():
+        out.append({"type_of_project": type_of_project, "tech_coe": coe, **v})
+    return out

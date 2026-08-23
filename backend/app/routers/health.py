@@ -1,0 +1,65 @@
+from fastapi import APIRouter, HTTPException, Query
+
+from app.core.db import reload as db_reload
+from app.services.health_detail_service import ProjectNotFound, get_project_health_detail, get_relief_staffing_candidates
+from app.services.health_monitor_service import get_health_report, get_project_wsr_sentiment, get_validation_summary
+from app.services.project_roster_service import get_project_info, get_project_roster
+
+router = APIRouter(prefix="/health-monitor", tags=["health-monitor"])
+
+@router.post("/reload-db")
+def reload_db() -> dict:
+    db_reload()
+    return {"ok": True, "message": "DuckDB cache cleared — next request will re-read all CSVs"}
+
+@router.get("/projects")
+def projects() -> list[dict]:
+    return get_health_report()
+
+@router.get("/validation")
+def validation() -> dict:
+    return get_validation_summary(get_health_report())
+
+@router.get("/projects/{project_code}/roster")
+def roster(project_code: str) -> dict:
+    return get_project_roster(project_code)
+
+@router.get("/projects/{project_code}/info")
+def project_info(project_code: str) -> dict:
+    info = get_project_info(project_code)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"project_code {project_code!r} not found")
+    return info
+
+@router.get("/projects/{project_code}/detail")
+def project_detail(project_code: str) -> dict:
+    try:
+        return get_project_health_detail(project_code)
+    except ProjectNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+@router.get("/projects/{project_code}/relief-candidates")
+def relief_candidates(
+    project_code: str,
+    top_n: int = 30,
+    include_skill: bool = Query(default=True),
+    include_competency: bool = Query(default=True),
+    include_availability: bool = Query(default=True),
+    include_category_match: bool = Query(default=False),
+    include_project_count: bool = Query(default=False),
+    include_coe_affinity: bool = Query(default=True),
+    include_cost_efficiency: bool = Query(default=False),
+) -> dict:
+    try:
+        return get_relief_staffing_candidates(
+            project_code, top_n=top_n,
+            include_skill=include_skill, include_competency=include_competency, include_availability=include_availability,
+            include_category_match=include_category_match, include_project_count=include_project_count,
+            include_coe_affinity=include_coe_affinity, include_cost_efficiency=include_cost_efficiency,
+        )
+    except ProjectNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+@router.get("/projects/{project_code}/sentiment")
+def project_sentiment(project_code: str, last_n: int = 8) -> dict:
+    return get_project_wsr_sentiment(project_code, last_n=last_n)

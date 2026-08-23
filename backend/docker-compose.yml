@@ -1,0 +1,32 @@
+﻿# Local dev only -- a real Postgres to point DATABASE_URL at, so "no local
+# dataset files" holds true even on a laptop, not just in AWS. Production
+# points DATABASE_URL at RDS instead; nothing else about the app changes.
+#
+# Usage:
+#   docker compose up -d
+#   DATABASE_URL=postgresql://resourceiq:resourceiq@localhost:5432/resourceiq uvicorn app.main:app --reload
+#   (or set DATABASE_URL in backend/.env -- see .env.example)
+#
+# First run has an empty database -- start the app, then either use the
+# Settings page to upload each dataset, or run the one-time dev seed script
+# to load the existing demo CSVs (if you still have them locally):
+#   python -m app.scripts.seed_postgres_from_local_files
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: resourceiq
+      POSTGRES_PASSWORD: resourceiq
+      POSTGRES_DB: resourceiq
+    ports:
+      - "5432:5432"
+    volumes:
+      - resourceiq_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resourceiq"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  resourceiq_pg_data:

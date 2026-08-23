@@ -1,0 +1,46 @@
+# Pinned to the exact versions confirmed working together in this app's real
+# dev environment (verified end-to-end this session, not just resolved by
+# pip) -- sentence-transformers/transformers in particular sit well above the
+# old ">=" floor because that's what's actually running, not a verified
+# lower bound.
+fastapi==0.136.1
+uvicorn[standard]==0.47.0
+duckdb==1.5.2
+pydantic==2.13.4
+pandas==3.0.3
+openpyxl==3.1.5
+anthropic==0.111.0
+google-genai==2.4.0
+openai==2.52.0
+python-dotenv==1.2.2
+requests==2.34.2
+apscheduler==3.11.3
+sentence-transformers==5.6.0
+transformers==5.12.1
+vaderSentiment==3.3.2
+pyodbc==5.3.0
+numpy==2.4.6
+sqlalchemy==2.0.44   # Postgres/RDS engine -- every dataset table + app-authored record lives there now (app/core/pg.py, dataset_store.py, appstate_db.py)
+psycopg2-binary==2.9.11   # Postgres driver for sqlalchemy above
+boto3==1.43.10   # S3 presigned uploads for large dataset/Excel/JDWH files (app/services/s3_upload_service.py) -- optional, degrades cleanly when AWS_* env vars are unset
+PyJWT[crypto]==2.10.1   # Microsoft Entra ID SSO -- verifies id_tokens (RS256/JWKS) and signs this app's own session cookie (HS256) in app/services/auth_service.py
+
+# Real, in-use dependencies that were missing from this file -- found via a
+# full import scan of app/, not guessed. Without these the app starts but
+# breaks the moment someone hits real SOW upload or a Pinecone-configured
+# semantic match.
+pinecone==9.1.0        # optional vector-search backend for skill-match ranking (embedding_engine.py) -- degrades to a plain numpy fallback when PINECONE_API_KEY/PINECONE_HOST are unset, but is genuinely called when they're set
+pypdf==6.15.0          # real SOW PDF text extraction (sow_extraction_service.py)
+python-docx==1.2.0     # real SOW .docx text extraction (sow_extraction_service.py) -- imported as `docx`
+python-multipart==0.0.20  # REQUIRED at import time, not optional: admin.py evaluates `UploadFile = File(...)` at module scope and fastapi>=0.113 no longer vendors this -- without it the dataset-upload routes raise on import and the whole app fails to boot
+
+# torch is a transitive dependency of sentence-transformers -- the Dockerfile
+# installs the CPU-only wheel explicitly (a separate RUN step, before this
+# file) rather than letting pip resolve the default CUDA build, which is
+# ~2-3GB heavier and useless on a CPU-only container.
+
+# Deliberately NOT included here: lightgbm, matplotlib, seaborn, scikit-learn.
+# Confirmed (via import scan) these are used only by the offline, one-off
+# model-retraining scripts under app/scripts/ (train_headcount_models.py,
+# select_headcount_features.py) -- nothing the running app imports at request
+# time needs them. Install separately only when re-running those scripts.

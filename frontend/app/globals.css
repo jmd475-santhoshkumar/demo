@@ -1,0 +1,175 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* JMAN Brand Color System -- carried over from AutoEDA (Light Mode) */
+    --background: 0 0% 98%;
+    --foreground: 255 71% 21%;
+
+    --primary: 255 81% 35%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 240 11% 95%;
+    --secondary-foreground: 255 71% 21%;
+
+    --muted: 240 11% 95%;
+    --muted-foreground: 248 19% 48%;
+
+    --accent: 240 11% 95%;
+    --accent-foreground: 255 71% 21%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 240 11% 91%;
+    --input: 240 11% 91%;
+    --ring: 255 81% 35%;
+    --radius: 0.5rem;
+
+    --brand: 255 81% 35%;
+    --brand-foreground: 0 0% 100%;
+
+    --card: 0 0% 100%;
+
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 255 71% 18%;
+    --sidebar-primary: 255 81% 35%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 255 55% 96%;
+    --sidebar-accent-foreground: 255 71% 18%;
+    --sidebar-border: 255 40% 91%;
+  }
+
+  /* JMAN Brand Color System (Dark Mode) -- neutral surfaces (background, card,
+     sidebar, borders, muted/secondary/accent) are true dark gray, NOT tinted
+     with the brand hue. Two things had to both be fixed, not just one: an
+     earlier version put hue 255 (the brand's indigo) on every neutral token
+     at 14-30% saturation; a first attempt at fixing it dropped the
+     saturation but kept hue 240 -- which in HSL IS literally blue (0=red,
+     120=green, 240=blue), so even at low saturation it still read as a cool
+     blue cast (confirmed real, not just perception). Neutral tokens are now
+     0% saturation -- true grayscale, where hue is meaningless and can't tint
+     anything regardless of value. The brand purple (hue 255) is kept ONLY on
+     primary/ring/brand/sidebar-primary -- the actual interactive accents
+     (buttons, links, focus rings, active nav) -- so it still reads as the
+     same product, it just doesn't bleed into every neutral panel and border. */
+  .dark {
+    --background: 0 0% 8%;
+    --foreground: 0 0% 92%;
+
+    --primary: 255 85% 68%;
+    --primary-foreground: 255 30% 10%;
+
+    --secondary: 0 0% 14%;
+    --secondary-foreground: 0 0% 88%;
+
+    --muted: 0 0% 15%;
+    --muted-foreground: 0 0% 60%;
+
+    --accent: 0 0% 16%;
+    --accent-foreground: 0 0% 90%;
+
+    --destructive: 0 72% 58%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 0 0% 20%;
+    --input: 0 0% 20%;
+    --ring: 255 85% 68%;
+
+    --brand: 255 85% 68%;
+    --brand-foreground: 255 30% 10%;
+
+    --card: 0 0% 10%;
+
+    --sidebar-background: 0 0% 5%;
+    --sidebar-foreground: 0 0% 88%;
+    --sidebar-primary: 255 85% 68%;
+    --sidebar-primary-foreground: 255 30% 10%;
+    --sidebar-accent: 0 0% 12%;
+    --sidebar-accent-foreground: 0 0% 92%;
+    --sidebar-border: 0 0% 15%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: #bab7ce;
+    border-radius: 16px;
+  }
+  .dark .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: #4a4560;
+  }
+}
+
+/* Real JMAN brand gradients -- per the brand guide: "Gradients go from
+   bottom left to top right, dark to light" (`to top right` in CSS, not the
+   135deg/top-left-to-bottom-right this used before) and "these are the only
+   gradients to be used." Exact brand hex stops, not approximations. */
+.bg-gradient-jman {
+  background: linear-gradient(to top right, #3411a3, #a16bdb); /* Trypan Blue -> Amethyst */
+}
+.bg-gradient-jman-dark {
+  background: linear-gradient(to top right, #19105b, #3411a3); /* Midnight Blue -> Trypan Blue */
+}
+
+/* Mascot animations -- ported from AutoEDA (parentfolder/autoeda-frontend/app/globals.css)
+   so Buddy's mascot animates identically to Scout's. */
+@keyframes mascot-antenna-left {
+  0%, 100% { transform: rotate(-4deg); }
+  50% { transform: rotate(6deg); }
+}
+@keyframes mascot-antenna-right {
+  0%, 100% { transform: rotate(4deg); }
+  50% { transform: rotate(-6deg); }
+}
+@keyframes mascot-arm-left {
+  0%, 80%, 100% { transform: rotate(-18deg); }
+  87%, 93% { transform: rotate(-38deg); }
+}
+@keyframes mascot-arm-right {
+  0%, 80%, 100% { transform: rotate(18deg); }
+  87%, 93% { transform: rotate(38deg); }
+}
+.mascot-antenna-left { transform-origin: 10.3px 6.8px; animation: mascot-antenna-left 2.6s ease-in-out infinite; }
+.mascot-antenna-right { transform-origin: 13.7px 6.8px; animation: mascot-antenna-right 2.6s ease-in-out infinite 0.3s; }
+.mascot-arm-left { transform-origin: 4.3px 13.5px; animation: mascot-arm-left 5s ease-in-out infinite; }
+.mascot-arm-right { transform-origin: 19.7px 13.5px; animation: mascot-arm-right 5s ease-in-out infinite; }
+
+@keyframes mascot-wiggle {
+  0%, 100% { transform: translateX(0) rotate(0deg); }
+  10%, 30%, 50% { transform: translateX(-0.6px) rotate(-2deg); }
+  20%, 40%, 60% { transform: translateX(0.6px) rotate(2deg); }
+  70% { transform: translateX(-0.3px) rotate(-1deg); }
+  80% { transform: translateX(0.3px) rotate(1deg); }
+  90% { transform: translateX(-0.1px) rotate(-0.3deg); }
+}
+.mascot-hover { transform-origin: 50% 95%; cursor: pointer; }
+.mascot-hover:hover { animation: mascot-wiggle 0.4s linear; }
+
+.mascot-energize-clip { transform-box: fill-box; transform-origin: center bottom; transform: scaleY(0); transition: transform 1.8s linear; }
+.mascot-hover:hover .mascot-energize-clip { transform: scaleY(1); }
+
+.mascot-antenna-color { stroke: #7C3AED; transition: stroke 0.5s linear; }
+.mascot-hover:hover .mascot-antenna-color { stroke: #EC4899; transition-delay: 1.3s; }

@@ -1,0 +1,10 @@
+# Compose secrets -- .env.example is the committed template.
+.env
+.env.*
+!.env.example
+
+# Live Postgres data directory (bind-mounted into the postgres container).
+db/data/
+
+# Local-dev compose overrides (Windows/WSL postgres volume fix).
+docker-compose.override.yml
