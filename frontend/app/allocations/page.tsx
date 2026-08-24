@@ -612,10 +612,10 @@ function ResourceRow({
       <td className="px-3 py-2 text-gray-500 dark:text-gray-400 whitespace-nowrap">{row.location ?? "-"}</td>
       {!hideProject && (
         <td className="px-3 py-2 max-w-[220px]">
-          <button onClick={onOpenProject} className="block text-left" title={row.project_name ?? undefined}>
+          <button onClick={onOpenProject} className="block w-full text-left" title={row.project_name ?? undefined}>
             <span className="text-primary hover:underline whitespace-nowrap">{row.project_id}</span>
             {row.project_name && (
-              <span className="block text-[11px] text-gray-400 dark:text-gray-500 truncate">{row.project_name}</span>
+              <span className="block w-full text-[11px] text-gray-400 dark:text-gray-500 truncate">{row.project_name}</span>
             )}
           </button>
         </td>
