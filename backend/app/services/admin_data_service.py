@@ -124,6 +124,26 @@ DATASET_REGISTRY = {
         "tables": [{"table": "coe_skills_mapping", "sheet_name": None, "label": "CoE Skills Mapping"}],
         "required_columns": ["coe"],
     },
+    # Real per-employee CoE, straight from the JIN data warehouse's own
+    # stg_jin.users (code, verticalId) and stg_jin.coe_config (id,
+    # verticalName) tables -- code joins to employees.employee_id, verticalId
+    # joins to coe_config.id. Same two tables, whether they arrive via a live
+    # JDWH pull or a manual upload here -- see employee_coe.py for how this
+    # takes priority over the old allocation-history-derived CoE guess.
+    "coe_users": {
+        "label": "CoE Users (JIN stg_jin.users)",
+        "description": "Per-employee code -> CoE vertical id, from the JIN data warehouse.",
+        "file_type": "csv",
+        "tables": [{"table": "coe_users", "sheet_name": None, "label": "CoE Users"}],
+        "required_columns": ["code", "verticalId"],
+    },
+    "coe_config": {
+        "label": "CoE Config (JIN stg_jin.coe_config)",
+        "description": "CoE vertical id -> real CoE name, from the JIN data warehouse.",
+        "file_type": "csv",
+        "tables": [{"table": "coe_config", "sheet_name": None, "label": "CoE Config"}],
+        "required_columns": ["id", "verticalName"],
+    },
 }
 
 

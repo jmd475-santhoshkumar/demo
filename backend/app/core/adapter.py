@@ -136,6 +136,12 @@ class DataSourceAdapter(ABC):
     def get_coe_skills_mapping(self) -> pd.DataFrame: ...
 
     @abstractmethod
+    def get_coe_users(self) -> pd.DataFrame: ...
+
+    @abstractmethod
+    def get_coe_config(self) -> pd.DataFrame: ...
+
+    @abstractmethod
     def get_budgets_jin(self) -> pd.DataFrame: ...
 
     @abstractmethod
@@ -255,6 +261,12 @@ class LocalAdapter(DataSourceAdapter):
     def get_coe_skills_mapping(self) -> pd.DataFrame:
         return self._query("coe_skills_mapping")
 
+    def get_coe_users(self) -> pd.DataFrame:
+        return self._query("coe_users")
+
+    def get_coe_config(self) -> pd.DataFrame:
+        return self._query("coe_config")
+
     def get_budgets_jin(self) -> pd.DataFrame:
         return self._query("budgets_jin")
 
@@ -323,6 +335,12 @@ class JinApiAdapter(DataSourceAdapter):
 
     def get_coe_skills_mapping(self) -> pd.DataFrame:
         self._not_implemented("/api/coe-skills-mapping")
+
+    def get_coe_users(self) -> pd.DataFrame:
+        self._not_implemented("/api/coe-users")
+
+    def get_coe_config(self) -> pd.DataFrame:
+        self._not_implemented("/api/coe-config")
 
 @lru_cache(maxsize=1)
 def _build_adapter() -> DataSourceAdapter:
