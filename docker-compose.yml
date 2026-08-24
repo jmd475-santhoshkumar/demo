@@ -42,9 +42,9 @@ services:
 
     # PostgreSQL is NOT exposed on the EC2 host.
     # Only the backend container connects to PostgreSQL.
-    #
-    # ports:
-    #   - "5432:5432"
+    
+    ports:
+      - "5432:5432"
 
     volumes:
       - ./db/data:/var/lib/postgresql/data
@@ -227,7 +227,7 @@ services:
       #
       # ALB sends HTTP:80 to EC2:80.
 
-      - "80:3000"
+      - "3000:3000"
 
 
     environment:
