@@ -140,7 +140,7 @@ def load_data() -> None:
 def stop_scheduler() -> None:
     scheduler.shutdown(wait=False)
 
-@app.get("/health")
+@app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
 
