@@ -8,3 +8,5 @@ db/data/
 
 # Local-dev compose overrides (Windows/WSL postgres volume fix).
 docker-compose.override.yml
+
+db/init/*
