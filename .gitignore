@@ -10,3 +10,4 @@ db/data/
 docker-compose.override.yml
 
 db/init/*
+db/init/resourceiq_initial_data_dump.sql
