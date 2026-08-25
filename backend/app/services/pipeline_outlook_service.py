@@ -4,6 +4,7 @@ from app.core.adapter import get_adapter
 from app.engines.resource_code_decoder import decode_resource_code, group_label
 from app.engines.revenue_engine import delivery_revenue_for_duration
 from app.engines.skillset_classifier import classify_skillset
+from app.services.allocation_report_service import NON_CLIENT_PROJECT_TYPES
 from app.services.demand_forecast_service import MIN_AVAILABLE_PCT_TO_SURFACE
 from app.services.recommendation_service import INTERNAL_PROJECT_TYPE, availability_as_of
 
@@ -57,9 +58,22 @@ def _enrich_pipeline(pipeline: pd.DataFrame, granularity: str = "month") -> pd.D
     pipeline["is_late_notice"] = (notice_days < LATE_NOTICE_THRESHOLD_DAYS).where(has_notice, None)
     return pipeline
 
-def _enrich_supply(allocations: pd.DataFrame, employees: pd.DataFrame, granularity: str = "month") -> pd.DataFrame:
+def _enrich_supply(allocations: pd.DataFrame, employees: pd.DataFrame, projects: pd.DataFrame, granularity: str = "month") -> pd.DataFrame:
     freed = allocations.merge(employees[["employee_id", "job_name", "department_name", "location"]], on="employee_id", how="left")
-    freed = freed[freed["is_allocation_active"] == 1].copy()
+    freed = freed.merge(
+        projects[["project_code", "type_of_project"]].rename(columns={"project_code": "project_id"}),
+        on="project_id", how="left",
+    )
+    # An Internal Project/BAU Activity/Sales Activity allocation ending doesn't free up any
+    # real capacity -- those types are never counted as "busy" in availability_as_of() (used
+    # a few sections below on this same page for the role/shortfall math), so someone whose
+    # ONLY ending allocation is one of these was already available the whole time. Without
+    # this filter, "projected supply" silently overcounted (confirmed against real data: 171
+    # of 914 real employee-months in the freeing-up window, ~19%, had no real Client Project/
+    # Managed Services allocation ending at all -- only an Internal Project one).
+    freed = freed[
+        (freed["is_allocation_active"] == 1) & (~freed["type_of_project"].isin(NON_CLIENT_PROJECT_TYPES))
+    ].copy()
     freed["end_month"] = _period_label_series(freed["allocated_end_date"], granularity)
     return freed
 
@@ -233,7 +247,7 @@ def get_pipeline_outlook(
     allocations = adapter.get_allocations()
     projects = adapter.get_projects()
     pipeline = _enrich_pipeline(adapter.get_pipeline_forecast(), granularity)
-    freed = _enrich_supply(allocations, employees, granularity)
+    freed = _enrich_supply(allocations, employees, projects, granularity)
 
     real_max_demand_month = pipeline["month"][pipeline["likely_start_date"].notna()].max() if pipeline["likely_start_date"].notna().any() else None
     real_max_supply_month = freed["end_month"][freed["allocated_end_date"].notna()].max() if freed["allocated_end_date"].notna().any() else None
@@ -258,14 +272,22 @@ def get_pipeline_outlook(
     # which reads as 7 separate opportunities when it's really 1. Surfaced
     # alongside it so a small deal_count next to a bigger request count is
     # self-explanatory instead of looking like a shortfall in the data.
-    deal_counts = in_window.drop_duplicates("deal_id").groupby(["month", "is_confirmed"]).size()
+    # A deal's role-request rows can carry different likely_start_dates (confirmed real
+    # data: 3 of 44 real deals span 2 different months) -- sorted by month first so
+    # drop_duplicates deterministically keeps each deal's EARLIEST month rather than
+    # whichever row happened to come first in an arbitrary, unsorted frame order. Applied
+    # identically to deal_counts and both value sums below so a given deal is always
+    # attributed to the same single month everywhere on this page, never split or double
+    # counted depending on which computation runs first.
+    sorted_by_month = in_window.sort_values("month")
+    deal_counts = sorted_by_month.drop_duplicates("deal_id").groupby(["month", "is_confirmed"]).size()
     # A deal_id can span several role-request rows (~5.2 on average) -- dedupe to one row
     # per deal before summing so a project's flat value is counted once, not once per role.
     confirmed_value_by_month = (
-        in_window[in_window["is_confirmed"]].drop_duplicates("deal_id").groupby("month")["deal_value_usd"].sum()
+        sorted_by_month[sorted_by_month["is_confirmed"]].drop_duplicates("deal_id").groupby("month")["deal_value_usd"].sum()
     )
     unconfirmed_value_by_month = (
-        in_window[~in_window["is_confirmed"]].drop_duplicates("deal_id").groupby("month")["deal_value_usd"].sum()
+        sorted_by_month[~sorted_by_month["is_confirmed"]].drop_duplicates("deal_id").groupby("month")["deal_value_usd"].sum()
     )
 
     confirmed_role_rows, first_shortfall_month, first_shortfall_roles = _role_demand_rows(
@@ -325,16 +347,23 @@ def get_pipeline_outlook(
 
     cluster_scorecards = []
     for cluster_id, grp in in_window.groupby("cluster"):
-        resolved_value = grp.drop_duplicates("deal_id")["deal_value_usd"].sum()
+        # deal_count/confirmed_count/unconfirmed_count/sow_signed_rate_pct/value_usd are all
+        # computed on ONE row per real deal_id -- every other "deal count" on this page (the
+        # months table, the role-demand table copy) is deduped the same way, and a raw
+        # row count here would silently disagree with value_usd on the very same card (which
+        # was already deduped) since a deal_id can span several role-request rows.
+        deals_deduped = grp.drop_duplicates("deal_id")
+        deal_count = len(deals_deduped)
+        resolved_value = deals_deduped["deal_value_usd"].sum()
         top_roles = grp["role_label"].value_counts().head(3)
         top_skills = pd.Series([s for row in grp["skill_areas"] for s in row]).value_counts().head(3) if grp["skill_areas"].apply(len).sum() else pd.Series(dtype=int)
         cluster_scorecards.append(
             {
                 "cluster": int(cluster_id),
-                "deal_count": int(len(grp)),
-                "confirmed_count": int(grp["is_confirmed"].sum()),
-                "unconfirmed_count": int((~grp["is_confirmed"]).sum()),
-                "sow_signed_rate_pct": round(100 * grp["is_confirmed"].mean(), 1) if len(grp) else 0.0,
+                "deal_count": int(deal_count),
+                "confirmed_count": int(deals_deduped["is_confirmed"].sum()),
+                "unconfirmed_count": int((~deals_deduped["is_confirmed"]).sum()),
+                "sow_signed_rate_pct": round(100 * deals_deduped["is_confirmed"].mean(), 1) if deal_count else 0.0,
                 "value_usd": round(float(resolved_value), 2) if pd.notna(resolved_value) else 0.0,
                 "top_roles": [{"role": k, "count": int(v)} for k, v in top_roles.items()],
                 "top_skill_areas": [{"skill_area": k, "count": int(v)} for k, v in top_skills.items()],
@@ -432,7 +461,7 @@ def get_pipeline_outlook_drilldown(
     supply_note: str | None = None
     designation_roster: list[dict] = []
     if dimension == "supply" and month:
-        freed = _enrich_supply(adapter.get_allocations(), adapter.get_employees(), granularity)
+        freed = _enrich_supply(adapter.get_allocations(), adapter.get_employees(), adapter.get_projects(), granularity)
         anomaly_date, supply_note = _anomaly_date_for_month(freed, month)
         month_freed = freed[freed["end_month"] == month].drop_duplicates("employee_id")
         supply_employees = [_supply_dict(r, anomaly_date) for _, r in month_freed.iterrows()]

@@ -3,17 +3,78 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Send, Sparkles, Loader2, Plus, Trash2, MessageSquare, PanelLeftClose, PanelLeftOpen, X, ChevronDown, ChevronUp, Wrench, ThumbsUp, ThumbsDown } from "lucide-react";
+import { Send, Sparkles, Loader2, Plus, Trash2, MessageSquare, PanelLeftClose, PanelLeftOpen, X, ChevronDown, ChevronUp, Wrench, ThumbsUp, ThumbsDown, ExternalLink, UserRound, FolderKanban, Users } from "lucide-react";
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from "recharts";
 import { cn, formatUsd } from "@/lib/utils";
 import { Mascot } from "@/components/shared/Mascot";
 import { buddyAskStream, buddyRate, type BuddyStat, type BuddyTable, type BuddyToolCall } from "@/lib/api";
-import { EmployeeProfileModal } from "@/components/shared/EmployeeProfileModal";
+import { EmployeeProfileModal, type ProfileTab } from "@/components/shared/EmployeeProfileModal";
 import { ProjectHealthDetailModal } from "@/components/health/ProjectHealthDetailModal";
+import { ClusterGovernanceView } from "@/components/health/ClusterGovernanceView";
 import { Modal } from "@/components/shared/Modal";
 
 const EMPLOYEE_COLUMNS = new Set(["Employee"]);
 const PROJECT_COLUMNS = new Set(["Project"]);
+
+// Matches ProjectHealthDetailModal's internal (unexported) DetailTab union --
+// kept as a separate local type rather than exporting theirs, since this is
+// the only file outside that component that needs to pick a starting tab.
+type ProjectTabHint = "overview" | "extensions" | "allocations" | "staffing" | "overtime" | "relief" | "wsr" | "devops";
+
+// Buddy tools that take a real employee_id/project_code/cluster_number as an
+// ARGUMENT (not just somewhere in their result) -- reliable enough to drive
+// "open the real page for this" actions straight from the tool-call trace,
+// without re-parsing each tool's differently-shaped result payload.
+const EMPLOYEE_ENTITY_TOOLS: Record<string, ProfileTab> = {
+  get_employee_profile: "overview",
+  get_employee_feedback: "feedback",
+  get_employee_performance_summary: "feedback",
+  get_employee_pulse: "timesheet",
+  get_redeploy_matches_for_employee: "redeploy_matches",
+};
+const PROJECT_ENTITY_TOOLS: Record<string, ProjectTabHint | undefined> = {
+  get_project_health_detail: "overview",
+  get_relief_staffing_candidates: "relief",
+  get_project_roster: "staffing",
+  get_project_extension_history: "extensions",
+  get_project_info: undefined,
+  get_project_budget: undefined,
+  get_project_kickoff_status: undefined,
+  get_project_gdpr_status: undefined,
+  get_team_size_fit: undefined,
+  get_project_sentiment: undefined,
+  get_project_alumni: undefined,
+};
+const CLUSTER_ENTITY_TOOLS = new Set(["get_cluster_governance_detail"]);
+
+interface QuickViewEntities {
+  employees: { id: string; tab: ProfileTab }[];
+  projects: { code: string; tab: ProjectTabHint | undefined }[];
+  clusters: number[];
+}
+
+function extractQuickViewEntities(trace: BuddyToolCall[] | undefined): QuickViewEntities {
+  const employees = new Map<string, ProfileTab>();
+  const projects = new Map<string, ProjectTabHint | undefined>();
+  const clusters = new Set<number>();
+  for (const t of trace ?? []) {
+    const args = t.arguments ?? {};
+    if (t.tool in EMPLOYEE_ENTITY_TOOLS && typeof args.employee_id === "string" && args.employee_id) {
+      employees.set(args.employee_id, EMPLOYEE_ENTITY_TOOLS[t.tool]);
+    }
+    if (t.tool in PROJECT_ENTITY_TOOLS && typeof args.project_code === "string" && args.project_code) {
+      projects.set(args.project_code, PROJECT_ENTITY_TOOLS[t.tool]);
+    }
+    if (CLUSTER_ENTITY_TOOLS.has(t.tool) && typeof args.cluster_number === "number") {
+      clusters.add(args.cluster_number);
+    }
+  }
+  return {
+    employees: [...employees].map(([id, tab]) => ({ id, tab })),
+    projects: [...projects].map(([code, tab]) => ({ code, tab })),
+    clusters: [...clusters],
+  };
+}
 
 const TOOL_LABELS: Record<string, string> = {
   get_recommendations: "Searching candidates",
@@ -45,6 +106,19 @@ const TOOL_LABELS: Record<string, string> = {
   get_project_roster: "Pulling project roster",
   get_project_info: "Looking up project info",
   get_revenue_trend: "Pulling revenue trend",
+  get_employee_feedback: "Pulling HR/PM feedback",
+  get_employee_performance_summary: "Pulling KRA performance history",
+  get_employee_pulse: "Checking wellbeing pulse survey",
+  get_governance_clusters: "Looking up governance clusters",
+  get_cluster_governance_detail: "Pulling cluster governance dashboard",
+  get_headcount_prediction: "Running headcount forecast",
+  get_project_budget: "Pulling project budget",
+  get_project_kickoff_status: "Checking kickoff checklist",
+  get_project_gdpr_status: "Checking GDPR record",
+  get_project_extension_history: "Pulling extension history",
+  get_team_size_fit: "Checking team-size fit",
+  get_project_sentiment: "Analyzing WSR sentiment",
+  get_project_alumni: "Finding project alumni",
   query_database: "Running a database query",
 };
 
@@ -132,6 +206,8 @@ const SUGGESTIONS = [
   "Who's going on leave soon, and is there a backfill?",
   "What roles does a typical AI project need, and what do they cost?",
   "What does the pipeline outlook look like for the next quarter?",
+  "What's the governance status of cluster 2 right now?",
+  "What will our headcount look like in 6 months?",
 ];
 
 function Avatar() {
@@ -504,6 +580,52 @@ function BuddyBreakdown({
   );
 }
 
+function EntityQuickView({
+  trace,
+  onEmployeeClick,
+  onProjectClick,
+  onClusterClick,
+}: {
+  trace: BuddyToolCall[] | undefined;
+  onEmployeeClick: (id: string, tab: ProfileTab) => void;
+  onProjectClick: (code: string, tab: ProjectTabHint | undefined) => void;
+  onClusterClick: (n: number) => void;
+}) {
+  const { employees, projects, clusters } = extractQuickViewEntities(trace);
+  if (employees.length === 0 && projects.length === 0 && clusters.length === 0) return null;
+
+  const pillCls =
+    "inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1.5 rounded-full border transition " +
+    "border-gray-200 bg-white text-gray-700 hover:border-[hsl(var(--primary))] hover:text-[hsl(var(--primary))] " +
+    "dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300";
+
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap">
+      {employees.map(({ id, tab }) => (
+        <button key={`emp-${id}`} onClick={() => onEmployeeClick(id, tab)} className={pillCls}>
+          <UserRound className="w-3 h-3 flex-shrink-0" />
+          {id}'s profile
+          <ExternalLink className="w-2.5 h-2.5 flex-shrink-0 opacity-50" />
+        </button>
+      ))}
+      {projects.map(({ code, tab }) => (
+        <button key={`proj-${code}`} onClick={() => onProjectClick(code, tab)} className={pillCls}>
+          <FolderKanban className="w-3 h-3 flex-shrink-0" />
+          {code} detail
+          <ExternalLink className="w-2.5 h-2.5 flex-shrink-0 opacity-50" />
+        </button>
+      ))}
+      {clusters.map((n) => (
+        <button key={`cluster-${n}`} onClick={() => onClusterClick(n)} className={pillCls}>
+          <Users className="w-3 h-3 flex-shrink-0" />
+          Cluster {n} governance
+          <ExternalLink className="w-2.5 h-2.5 flex-shrink-0 opacity-50" />
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function formatArgValue(v: unknown): string {
   if (v === null || v === undefined) return "—";
   if (typeof v === "string") return v.length > 50 ? `${v.slice(0, 50)}…` : v;
@@ -518,7 +640,7 @@ function formatArgValue(v: unknown): string {
 }
 
 function ToolTrace({ trace }: { trace: BuddyToolCall[] }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
   if (!trace.length) return null;
   return (
     <div className="w-full mt-1">
@@ -767,8 +889,20 @@ export default function BuddyPage() {
   const [sending, setSending] = useState(false);
   const [liveTools, setLiveTools] = useState<{ tool: string; done: boolean }[]>([]);
   const [selectedEmployee, setSelectedEmployee] = useState<string | null>(null);
+  const [selectedEmployeeTab, setSelectedEmployeeTab] = useState<ProfileTab>("overview");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
+  const [selectedProjectTab, setSelectedProjectTab] = useState<ProjectTabHint | undefined>(undefined);
+  const [selectedCluster, setSelectedCluster] = useState<number | null>(null);
   const [railMobileOpen, setRailMobileOpen] = useState(false);
+
+  function openEmployee(id: string, tab: ProfileTab = "overview") {
+    setSelectedEmployeeTab(tab);
+    setSelectedEmployee(id);
+  }
+  function openProject(code: string, tab?: ProjectTabHint) {
+    setSelectedProjectTab(tab);
+    setSelectedProject(code);
+  }
   const bottomRef = useRef<HTMLDivElement>(null);
   const skipNextPersist = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -968,7 +1102,7 @@ export default function BuddyPage() {
               </div>
             </div>
           ) : (
-            <div className="max-w-2xl mx-auto space-y-5">
+            <div className="max-w-5xl mx-auto space-y-5">
               {messages.map((m, i) => (
                 <div key={i} className={cn("flex gap-3", m.role === "user" ? "justify-end" : "justify-start")}>
                   {m.role === "assistant" && <Avatar />}
@@ -984,7 +1118,7 @@ export default function BuddyPage() {
                       {m.role === "assistant" ? <ChatMarkdown content={m.content} /> : m.content}
                     </div>
                     {m.role === "assistant" && m.format === "table" && m.table && (
-                      <ChatTable {...m.table} onEmployeeClick={setSelectedEmployee} onProjectClick={setSelectedProject} />
+                      <ChatTable {...m.table} onEmployeeClick={(id) => openEmployee(id)} onProjectClick={(code) => openProject(code)} />
                     )}
                     {m.role === "assistant" && m.format === "stats" && m.stats && (
                       <ChatStats items={m.stats} toolName={m.toolTrace?.[m.toolTrace.length - 1]?.tool} data={m.data} />
@@ -996,8 +1130,16 @@ export default function BuddyPage() {
                       <BuddyBreakdown
                         toolName={m.toolTrace?.[m.toolTrace.length - 1]?.tool}
                         data={m.data}
-                        onEmployeeClick={setSelectedEmployee}
-                        onProjectClick={setSelectedProject}
+                        onEmployeeClick={(id) => openEmployee(id)}
+                        onProjectClick={(code) => openProject(code)}
+                      />
+                    )}
+                    {m.role === "assistant" && (
+                      <EntityQuickView
+                        trace={m.toolTrace}
+                        onEmployeeClick={openEmployee}
+                        onProjectClick={openProject}
+                        onClusterClick={setSelectedCluster}
                       />
                     )}
                     {m.role === "assistant" && m.toolTrace && m.toolTrace.length > 0 && <ToolTrace trace={m.toolTrace} />}
@@ -1048,7 +1190,7 @@ export default function BuddyPage() {
         </div>
 
         <div className="border-t border-gray-100 px-3 sm:px-6 py-4 flex-shrink-0 dark:border-gray-800">
-          <div className="max-w-2xl mx-auto flex items-end gap-2.5">
+          <div className="max-w-5xl mx-auto flex items-end gap-2.5">
             <div className="flex-1 flex items-end gap-2 rounded-2xl border border-gray-200 bg-white px-4 py-2.5 focus-within:border-gray-300 transition dark:border-gray-700 dark:bg-gray-900 dark:focus-within:border-gray-600">
               <textarea
                 ref={textareaRef}
@@ -1074,9 +1216,24 @@ export default function BuddyPage() {
       </div>
 
       {selectedEmployee && (
-        <EmployeeProfileModal employeeId={selectedEmployee} initialTab="overview" onClose={() => setSelectedEmployee(null)} />
+        <EmployeeProfileModal employeeId={selectedEmployee} initialTab={selectedEmployeeTab} onClose={() => setSelectedEmployee(null)} />
       )}
-      {selectedProject && <ProjectHealthDetailModal projectCode={selectedProject} onClose={() => setSelectedProject(null)} />}
+      {selectedProject && (
+        <ProjectHealthDetailModal projectCode={selectedProject} initialTab={selectedProjectTab} onClose={() => setSelectedProject(null)} />
+      )}
+      {selectedCluster !== null && (
+        <Modal title="Cluster governance" onClose={() => setSelectedCluster(null)} widthClassName="max-w-6xl">
+          <div className="p-4 sm:p-5">
+            <ClusterGovernanceView
+              clusterNumber={selectedCluster}
+              week={undefined}
+              onBack={() => setSelectedCluster(null)}
+              onOpenProject={(code) => openProject(code, "overview")}
+              onBackToCurrentWeek={() => {}}
+            />
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

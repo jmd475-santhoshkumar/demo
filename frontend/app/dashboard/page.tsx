@@ -18,12 +18,17 @@ function normalize(value: string | null | undefined): string {
   return (value ?? "").trim().toLowerCase();
 }
 
+// Non-client placeholder/timesheet-bucket types (Internal Project, BAU Activity, Sales
+// Activity) that should never count as a real, billable "active allocation" -- same set as
+// the backend's NON_CLIENT_PROJECT_TYPES (allocation_report_service.py).
+const NON_CLIENT_PROJECT_TYPES = new Set(["Internal Project", "BAU Activity", "Sales Activity"]);
+
 export default function DashboardPage() {
   const tables = useQuery({ queryKey: ["tables"], queryFn: api.tables });
   const headcount = useQuery({ queryKey: ["employee-headcount-summary"], queryFn: api.employeeHeadcountSummary });
   const health = useQuery({ queryKey: ["health-projects"], queryFn: api.healthProjects });
   const allocations = useQuery({ queryKey: ["allocations"], queryFn: api.allocations });
-  const freePool = useQuery({ queryKey: ["free-pool"], queryFn: api.freePool });
+  const freePool = useQuery({ queryKey: ["free-pool"], queryFn: () => api.freePool() });
   const leave = useQuery({ queryKey: ["leave-impact"], queryFn: () => api.leaveImpact() });
   const pipeline = useQuery({ queryKey: ["pipeline-forecast"], queryFn: api.pipelineForecast });
 
@@ -50,6 +55,12 @@ export default function DashboardPage() {
   const mediumRisk = (health.data ?? []).filter((p) => p.risk_band === "medium");
   const understaffed = (health.data ?? []).filter((p) => p.is_understaffed);
   const endingSoon = (allocations.data ?? []).filter((a) => a.ending_soon).sort((a, b) => a.days_to_end - b.days_to_end);
+  // "Active Allocations" should mean real, billable client work -- Internal Project/BAU
+  // Activity/Sales Activity are internal timesheet buckets that virtually every employee
+  // carries regardless of real workload (confirmed real case: one BAU bucket alone logs
+  // ~987 of the whole company), so counting every row here inflated this into the tens of
+  // thousands instead of reflecting genuine client engagements.
+  const realActiveAllocations = (allocations.data ?? []).filter((a) => !NON_CLIENT_PROJECT_TYPES.has(a.type_of_project ?? ""));
   const overAllocated = (allocations.data ?? []).filter((a) => a.utilization_band === "over_allocated");
   const freePoolCounts = {
     fully_free: (freePool.data ?? []).filter((c) => c.reason === "fully_free").length,
@@ -72,9 +83,16 @@ export default function DashboardPage() {
   }
   const allocationTypeRows = Array.from(allocationsByType.entries()).sort((a, b) => b[1] - a[1]);
 
+  // "is_late_notice" only means the ORIGINAL request gave <14 days' lead time -- it says
+  // nothing about whether the likely_start_date has since actually come and gone while the
+  // role is still unresourced, which is real, more common, and arguably more urgent (confirmed
+  // real case: several Urgent/Not-Resourced rows with a likely_start_date weeks in the past
+  // showed no "late" badge at all since their original notice period had been fine).
+  const todayStr = new Date().toISOString().slice(0, 10);
   const urgentPipeline = (pipeline.data ?? [])
     .filter((r) => (r.skillset || r.resources_requested) && normalize(r.status) !== "resourced")
-    .filter((r) => normalize(r.priority) === "urgent" || r.is_late_notice)
+    .map((r) => ({ ...r, is_overdue: !!r.likely_start_date && r.likely_start_date < todayStr }))
+    .filter((r) => normalize(r.priority) === "urgent" || r.is_late_notice || r.is_overdue)
     .sort((a, b) => (a.likely_start_date ?? "").localeCompare(b.likely_start_date ?? ""))
     .slice(0, 5);
 
@@ -107,8 +125,8 @@ export default function DashboardPage() {
           tooltip={
             headcount.data && (
               <div className="space-y-1">
-                <p className="font-semibold text-gray-700 dark:text-gray-300">Delivery staff (active, client-facing): {headcount.data.delivery_active}</p>
-                <p>All active accounts (incl. Finance, HR, IT): {headcount.data.currently_active}</p>
+                <p className="font-semibold text-gray-700 dark:text-gray-300">Delivery staff (active JMD headcount): {headcount.data.delivery_active}</p>
+                <p>All active accounts (JMD + JMG/JML/JMU/Intern/Contractor/etc.): {headcount.data.currently_active}</p>
                 <p>Total ever on roster: {headcount.data.total_ever}</p>
                 <p>Already departed: {headcount.data.already_departed}</p>
                 <p>In notice period: {headcount.data.in_notice_period}</p>
@@ -118,7 +136,8 @@ export default function DashboardPage() {
         />
         <StatCard
           label="Active Allocations"
-          value={allocations.data?.length ?? "-"}
+          value={realActiveAllocations.length}
+          sub={allocations.data ? `of ${allocations.data.length} incl. internal/BAU/sales buckets` : undefined}
           icon={<Briefcase className="w-4 h-4" />}
           href="/allocations"
           tooltip={
@@ -145,7 +164,7 @@ export default function DashboardPage() {
         <StatCard
           label="Allocations Ending Soon"
           value={endingSoon.length}
-          sub="within 30 days"
+          sub="within 2 weeks"
           color="amber"
           icon={<Clock className="w-4 h-4" />}
           href="/allocations?endingSoon=true"
@@ -237,7 +256,7 @@ export default function DashboardPage() {
                 <span className="text-gray-400 ml-auto dark:text-gray-500">{a.days_to_end}d left</span>
               </button>
             ))}
-            {endingSoon.length === 0 && <p className="text-xs text-gray-400 italic dark:text-gray-500">Nothing ending in the next 30 days.</p>}
+            {endingSoon.length === 0 && <p className="text-xs text-gray-400 italic dark:text-gray-500">Nothing ending in the next 2 weeks.</p>}
           </div>
         </div>
       </div>
@@ -257,7 +276,8 @@ export default function DashboardPage() {
                 href={`/resourcing/deals?row=${r.row_index}`}
                 className="flex items-center gap-2 text-xs w-full text-left hover:bg-gray-50 rounded-lg px-1.5 py-1 -mx-1.5 transition dark:hover:bg-gray-800"
               >
-                {r.is_late_notice && <Badge variant="red">late</Badge>}
+                {r.is_overdue && <Badge variant="red">overdue</Badge>}
+                {!r.is_overdue && r.is_late_notice && <Badge variant="red">late</Badge>}
                 <span className="font-medium text-gray-700 dark:text-gray-300">{r.resources_requested ?? "Role TBD"}</span>
                 <span className="text-gray-400 truncate dark:text-gray-500">{r.client ?? "Unnamed client"}</span>
                 {r.likely_start_date && <span className="text-gray-400 ml-auto whitespace-nowrap dark:text-gray-500">{r.likely_start_date}</span>}

@@ -43,6 +43,18 @@ UNDERSTAFFED_RATIO_THRESHOLD = 0.75
 STANDARD_MONTHLY_HOURS = 160
 EXTENSION_DAILY_HOURS = 8.0
 
+# Governance reviews this list every week and only have bandwidth to walk
+# through a double-digit number of projects, not a few dozen -- and the
+# 3 most common root causes (understaffed, overtime_risk, wsr_risk; each
+# independently calibrated and reused elsewhere, e.g. the Dashboard's
+# "Understaffed" card) co-occur often enough that a flat ">= 2 causes"
+# threshold swings wildly with the data (was 4 projects at ">=3 causes",
+# 23 at ">=2"). Capping "high" at the N most severe of that ">=2" pool
+# keeps every individual detector's threshold untouched -- nothing stops
+# firing -- while making the headline "High Risk" count a stable,
+# actionable size instead of an accident of how many soft signals overlap.
+MAX_HIGH_RISK_PROJECTS = 12
+
 # ── DEMO ONLY ────────────────────────────────────────────────────────────
 # Most projects don't have their own tickets tagged to an AreaPath in Azure
 # DevOps yet, so their real per-project lookup below correctly returns no
@@ -394,7 +406,19 @@ def _compute_health_rows(active: pd.DataFrame, churn_p75_override: float | None 
         is_unbilled * (alloc_with_rate["allocation_by_percentage"] / 100) * alloc_with_rate["hourly_rate"].fillna(0) * STANDARD_MONTHLY_HOURS
     )
 
-    n_employees = allocations.groupby("project_id")["employee_id"].nunique().rename("n_employees")
+    # CURRENTLY active allocations only -- this feeds actual_headcount/is_understaffed
+    # and the "Team Size" number shown directly on the Health/Wellbeing pages, which
+    # both mean "who's on this team right now," not "who has ever rotated through it."
+    # Confirmed real bug when this counted ALL allocations regardless of status: e.g.
+    # BAU_028 showed 945 "current" employees (all-time distinct headcount) against only
+    # 289 actually active today, and ordinary client projects like JMG_184 showed 29 vs
+    # a real current team of 5 -- silently hiding real understaffing on any project with
+    # meaningful staff turnover, since the inflated historical count almost always
+    # cleared the UNDERSTAFFED_RATIO_THRESHOLD check regardless of who's really there now.
+    n_employees = (
+        allocations[allocations["is_allocation_active"] == 1]
+        .groupby("project_id")["employee_id"].nunique().rename("n_employees")
+    )
     # Only active, billable allocations count as evidence of a "current commitment".
     # Each row's own effective end date is its RM-entered extended_end_date when set
     # (explicit, gated on the project already being extended -- see
@@ -603,8 +627,17 @@ def _compute_health_rows(active: pd.DataFrame, churn_p75_override: float | None 
         expected = real_role_mix_by_project.get(row["project_code"]) or get_role_mix(row["type_of_project"], row["tech_coe"], templates=role_mix_templates)
         expected_headcount = expected.get("expected_headcount_common")
         actual_headcount = row["n_employees"] if pd.notna(row["n_employees"]) else 0
+        # A project that hasn't actually started yet (real project_start_date in the
+        # future -- confirmed real cases: e.g. a project starting next week, already
+        # marked ACTIVE ahead of kickoff) can't be "understaffed" -- it's just too
+        # early to expect anyone staffed on it. Missing start date doesn't suppress
+        # the flag (nothing to contradict it with).
+        start_date = row.get("project_start_date")
+        has_started = pd.isna(start_date) or start_date <= today
         is_understaffed = bool(
-            expected_headcount and expected_headcount > 0 and actual_headcount < expected_headcount * UNDERSTAFFED_RATIO_THRESHOLD
+            has_started
+            and expected_headcount and expected_headcount > 0
+            and actual_headcount < expected_headcount * UNDERSTAFFED_RATIO_THRESHOLD
         )
 
         project_code = row["project_code"]
@@ -674,11 +707,11 @@ def _compute_health_rows(active: pd.DataFrame, churn_p75_override: float | None 
             root_causes.append("pulse_risk")
 
         risk_score = len(root_causes)
-        # Thresholds recalibrated against real data: with real root-cause
-        # signals (high_churn/wsr_risk/effort_spike/shadow_heavy/understaffed/
-        # devops_extension_risk/pulse_risk), projects essentially never stack
-        # 3+ simultaneously (confirmed: 0 of 94 active real projects did, out
-        # of a possible 7 causes) -- >=3 for "high" made the band structurally
+        # Thresholds recalibrated against real data: with real root-cause signals
+        # (high_churn/wsr_risk/effort_spike/shadow_heavy/understaffed/
+        # devops_extension_risk/pulse_risk), projects essentially never stack 3+
+        # simultaneously (out of a possible 7 causes; only a rare handful of active
+        # real projects ever do) -- >=3 for "high" made the band structurally
         # unreachable. >=2/==1 actually differentiates real projects instead.
         risk_band = "high" if risk_score >= 2 else ("medium" if risk_score == 1 else "low")
 
@@ -754,6 +787,30 @@ def _compute_health_rows(active: pd.DataFrame, churn_p75_override: float | None 
                 # ── END NEW ────────────────────────────────────────────────
             }
         )
+
+    # Cap "high" at the MAX_HIGH_RISK_PROJECTS most severe of the risk_score>=2
+    # pool -- rank by real signals already on the row (more root causes first;
+    # then whether a genuinely client/timeline-facing cause fired, escalation
+    # or extension, over a purely staffing/people combo; then actual WSR
+    # severity, overrun days, and unbilled $ as further real tiebreaks) and
+    # demote the rest to "medium". They're still fully surfaced -- just not
+    # top-tier -- so no signal is hidden, only re-ranked.
+    def _high_risk_rank_key(r: dict) -> tuple:
+        has_severe_cause = any(
+            ROOT_CAUSE_CATEGORY.get(c) in ("escalation", "extension") for c in r["root_causes"]
+        )
+        return (
+            -r["risk_score"],
+            0 if has_severe_cause else 1,
+            -_RAG_SEVERITY.get(r.get("wsr_worst_signal") or "", -1),
+            -(r.get("overrun_days") or 0),
+            -(r.get("monthly_unbilled_value_usd") or 0),
+        )
+
+    high_risk_candidates = [r for r in records if r["risk_band"] == "high"]
+    if len(high_risk_candidates) > MAX_HIGH_RISK_PROJECTS:
+        for r in sorted(high_risk_candidates, key=_high_risk_rank_key)[MAX_HIGH_RISK_PROJECTS:]:
+            r["risk_band"] = "medium"
 
     return sorted(records, key=lambda r: r["risk_score"], reverse=True)
 

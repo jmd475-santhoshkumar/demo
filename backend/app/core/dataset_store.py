@@ -28,7 +28,7 @@ KNOWN_TABLES = [
     "wsr_reports", "leaves", "weekly_pulse", "hr_feedback", "performance_cycles",
     "performance_kra_items", "budgets_jin", "budget_resources_jin",
     "pipeline_forecast", "pipeline_skillset", "pipeline_hierarchy", "pipeline_revenue",
-    "coe_skills_mapping",
+    "coe_skills_mapping", "coe_users", "coe_config",
 ]
 
 _BACKUP_PREFIX = "zz_backup__"

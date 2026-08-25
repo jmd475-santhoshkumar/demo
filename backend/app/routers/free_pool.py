@@ -6,8 +6,8 @@ from app.services.recommendation_service import get_redeploy_matches_for_employe
 router = APIRouter(prefix="/free-pool", tags=["free-pool"])
 
 @router.get("")
-def free_pool() -> list[dict]:
-    return get_free_pool()
+def free_pool(jmd_only: bool = Query(default=False)) -> list[dict]:
+    return get_free_pool(jmd_only=jmd_only)
 
 @router.get("/{employee_id}/matches")
 def free_pool_matches(

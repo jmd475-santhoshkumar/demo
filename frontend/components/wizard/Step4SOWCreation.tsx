@@ -192,6 +192,12 @@ function SowExtractionPanel({ projectCode, filename }: { projectCode: string; fi
       </div>
 
       <div className="px-4 pt-2.5 pb-4 space-y-3.5">
+        {data.project_mismatch_warning && (
+          <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[11px] text-red-800 dark:border-red-800/60 dark:bg-red-950/40 dark:text-red-300">
+            <AlertCircle size={13} className="flex-shrink-0 mt-0.5" />
+            <span>{data.project_mismatch_warning}</span>
+          </div>
+        )}
         {contextChips.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {contextChips.map(({ icon: Icon, text }, i) => (

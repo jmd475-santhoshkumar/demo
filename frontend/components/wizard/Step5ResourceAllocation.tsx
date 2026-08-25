@@ -30,7 +30,7 @@ interface DraftRow {
   shiftType: string;
   reviewerEmployeeId: string;
   allocationPct: number;
-  source: "budget" | "cloned";
+  source: "budget" | "cloned" | "sow";
 }
 
 export function Step5ResourceAllocation({
@@ -57,6 +57,15 @@ export function Step5ResourceAllocation({
   const budget = useQuery({
     queryKey: ["project-budget", projectCode],
     queryFn: () => api.getProjectBudget(projectCode as string),
+    enabled: projectCode != null,
+  });
+  // Real SOW-vs-budget role alignment, plus any real named person the SOW
+  // specified for a role -- only meaningful once a SOW has actually been
+  // extracted (Step 4), so a project with no SOW extraction yet just gets
+  // has_sow_data: false and this whole feature quietly does nothing.
+  const sowComparison = useQuery({
+    queryKey: ["sow-compare-budget", projectCode],
+    queryFn: () => api.sowCompareBudget(projectCode as string),
     enabled: projectCode != null,
   });
   const employees = useQuery({ queryKey: ["employees-list"], queryFn: api.employeesList });
@@ -117,11 +126,23 @@ export function Step5ResourceAllocation({
     if (!e.job_name) continue;
     (allByDesignation[e.job_name] ??= []).push(e);
   }
-  function optionsForDesignation(designation: string) {
+  // mustIncludeEmployeeId: a row can be pre-set to a real employee whose OWN
+  // real job title doesn't exactly match this row's designation (confirmed
+  // real case: a SOW named a "Consultant" for the role, but that specific
+  // real employee's own title is "Associate Consultant" -- a different, also
+  // real designation) -- without this, that employee never appears in their
+  // own dropdown's option list at all, so the row silently renders as blank
+  // ("Select ...") even though the correct employee_id is already set.
+  function optionsForDesignation(designation: string, mustIncludeEmployeeId?: string) {
     const ranked = candidatesByDesignation[designation] ?? [];
     const seen = new Set(ranked.map((c) => c.employee_id));
     const rest = (allByDesignation[designation] ?? []).filter((e) => !seen.has(e.employee_id));
-    return [...ranked, ...rest].map((c) => ({
+    let combined: { employee_id: string; employee_full_name: string | null }[] = [...ranked, ...rest];
+    if (mustIncludeEmployeeId && !combined.some((c) => c.employee_id === mustIncludeEmployeeId)) {
+      const forced = (employees.data ?? []).find((e) => e.employee_id === mustIncludeEmployeeId);
+      if (forced) combined = [forced, ...combined];
+    }
+    return combined.map((c) => ({
       value: c.employee_id,
       label: c.employee_full_name ? `${c.employee_id} - ${c.employee_full_name} (${designation})` : `${c.employee_id} (${designation})`,
     }));
@@ -191,6 +212,61 @@ export function Step5ResourceAllocation({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectCode, budget.data, roster.data, topCandidatesLoading]);
+
+  // Any real person the SOW explicitly named for a role (Step 4 extraction),
+  // resolved to a real employee_id, gets its own draft row tagged source:
+  // "sow" -- distinct from the generic "top candidate by availability"
+  // suggestions above, since the SOW itself already decided who fills this
+  // seat. Skipped if that person is already on the real roster or already has
+  // a draft (any source) for this project, so it never duplicates a row.
+  useEffect(() => {
+    const namedPeople = sowComparison.data?.named_people;
+    // Real bug this guards against: this effect only ever ADDS a draft, never
+    // corrects one already added -- if it ran once before the employee list
+    // finished loading, jobNameById below would be empty, so a role whose SOW
+    // text doesn't match this person's own real title (e.g. "Snr. Oversight"
+    // for someone whose real title is "Principal") would permanently lock in
+    // the literal SOW text as the designation instead of a real one.
+    if (!projectCode || !namedPeople?.length || employees.isLoading) return;
+
+    setDrafts((prevDrafts) => {
+      const realEmployeeIds = new Set((roster.data?.roster ?? []).map((r) => r.employee_id));
+      const draftEmployeeIds = new Set(prevDrafts.map((d) => d.employeeId).filter(Boolean));
+      const jobNameById = new Map((employees.data ?? []).map((e) => [e.employee_id, e.job_name]));
+
+      const additions: DraftRow[] = [];
+      namedPeople.forEach((p, idx) => {
+        const empId = p.resolved_employee_id;
+        if (!empId || realEmployeeIds.has(empId) || draftEmployeeIds.has(empId)) return;
+        draftEmployeeIds.add(empId);
+        // Prefer the SOW's own role text when it's a real designation; otherwise
+        // fall back to this employee's real current job title rather than
+        // guessing -- either way the row starts on a real, valid designation.
+        const designation = (p.matches_real_designation && p.role_text) || jobNameById.get(empId) || p.role_text;
+        // The SOW text itself never states a percentage for this role (checked
+        // directly against the real document) -- but an "oversight"-type role
+        // (e.g. bi-weekly ExCo / weekly SteerCo attendance, not day-to-day
+        // delivery work) is real-world light-touch, not full-time, so it
+        // defaults lower than a normal delivery role rather than assuming 100%.
+        const allocationPct = /oversight/i.test(p.role_text) ? 25 : 100;
+        additions.push({
+          key: `sow-draft-${idx}`,
+          designation,
+          employeeId: empId,
+          startDate: projectDates?.startDate || todayStr(),
+          endDate: projectDates?.endDate || todayStr(),
+          resourcingStatus: "BILLABLE",
+          shiftType: "General",
+          reviewerEmployeeId: "",
+          allocationPct,
+          source: "sow",
+        });
+      });
+
+      return additions.length > 0 ? [...prevDrafts, ...additions] : prevDrafts;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectCode, sowComparison.data, roster.data, employees.data, employees.isLoading]);
 
   // When a project's end date is extended (see ProjectWizard's confirm modal),
   // carry every currently-active real allocation forward into the new period --
@@ -299,6 +375,13 @@ export function Step5ResourceAllocation({
                           <span title="Cloned from a prior allocation -- continuing into the extended project period" className="flex-shrink-0 inline-flex">
                             <RefreshCw size={13} className="text-blue-500 dark:text-blue-400" />
                           </span>
+                        ) : d.source === "sow" ? (
+                          <span
+                            title="Named for this role in the uploaded SOW"
+                            className="flex-shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wide bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300"
+                          >
+                            SOW
+                          </span>
                         ) : (
                           <span title="Suggested from Budget" className="flex-shrink-0 inline-flex">
                             <Sparkles size={13} className="text-amber-500 dark:text-amber-400" />
@@ -307,7 +390,7 @@ export function Step5ResourceAllocation({
                         <SearchableSelect
                           size="sm"
                           className="flex-1"
-                          options={optionsForDesignation(d.designation)}
+                          options={optionsForDesignation(d.designation, d.employeeId || undefined)}
                           value={d.employeeId ? [d.employeeId] : []}
                           onChange={(v) => updateDraft(d.key, { employeeId: v[0] ?? "" })}
                           placeholder={`Select ${d.designation}`}

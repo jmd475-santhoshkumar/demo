@@ -123,6 +123,55 @@ export interface DocxCategoryRoleMix {
   resolved_via?: Record<string, unknown>;
 }
 
+export interface TeamSizeBucketExample {
+  project_code: string;
+  project_name: string | null;
+  // Only populated for a risky example -- which real signal(s) fired (a
+  // real extension and whether it was billable/unbillable, a WSR RED
+  // status, a real WSR risk note, a real logged Cluster Governance risk, or
+  // a real effort spike near the project's end).
+  reasons?: string[];
+}
+
+export interface TeamSizeBucket {
+  headcount: number;
+  total: number;
+  clean: number;
+  risky: number;
+  clean_rate: number | null;
+  clean_examples: TeamSizeBucketExample[];
+  risky_examples: TeamSizeBucketExample[];
+}
+
+// Minimal-change guidance for the team currently selected in the budget --
+// does its headcount match a size that historically stayed clean for real
+// completed projects of this same type/CoE, or would adding/removing
+// exactly one person (of a specific role) have a meaningfully better track
+// record. See backend/app/engines/role_mix_engine.py's analyze_team_size_fit.
+export interface TeamSizeFitResult {
+  current_headcount: number;
+  recommendation: "sufficient" | "add_one" | "remove_one" | "not_enough_data" | "no_data" | "unknown_project";
+  suggested_role?: string | null;
+  coe: string | null;
+  type_of_project: string | null;
+  proposition_coe: string | null;
+  matched_by: string | null;
+  // The real duration this project is planned for, and whether precedent
+  // projects were also narrowed to a similar length (0.5x-2x) before
+  // bucketing by headcount -- only applied when enough precedents remain to
+  // still bucket meaningfully, else the comparison stays type/CoE-only.
+  target_duration_weeks?: number | null;
+  duration_narrowed?: boolean;
+  current_bucket?: TeamSizeBucket;
+  smaller_bucket?: TeamSizeBucket | null;
+  larger_bucket?: TeamSizeBucket;
+  best_bucket?: TeamSizeBucket;
+  // AI-generated plain-language read of the same real numbers above -- null
+  // whenever no AI provider is configured, a call fails, or there's nothing
+  // to reason about yet (see backend/app/services/team_size_insight_service.py).
+  ai_summary?: string | null;
+}
+
 export type StaffingSignal = "redeploy" | "redeploy_with_training" | "hire" | "not_assessed";
 export type CandidateBucket = "eligible" | "trainable" | "gap" | "not_assessed";
 
@@ -2116,6 +2165,31 @@ export interface SowExtractionResult {
   project_reference: string | null;
   engagement_duration: string | null;
   scope_summary: string | null;
+  project_mismatch_warning: string | null;
+}
+
+export interface SowRoleComparisonRow {
+  role: string;
+  sow_count: number;
+  budget_count: number;
+  aligned: boolean;
+}
+
+export interface SowNamedPerson {
+  role_text: string;
+  matches_real_designation: boolean;
+  named_person: string;
+  resolved_employee_id: string | null;
+  source_filename: string | null;
+}
+
+export interface SowBudgetComparison {
+  has_sow_data: boolean;
+  has_budget_data: boolean;
+  role_comparison: SowRoleComparisonRow[];
+  fully_aligned: boolean | null;
+  unmatched_sow_roles: string[];
+  named_people: SowNamedPerson[];
 }
 
 // Chat with one SOW -- strictly document-scoped Q&A. Every citation is
@@ -2294,7 +2368,8 @@ export const api = {
   employeeHeadcountSummary: () => getJSON<EmployeeHeadcountSummary>("/employees/headcount-summary"),
   overtimeRiskSummary: () => getJSON<OvertimeRiskSummary>("/employees/overtime-risk-summary"),
   employeesList: () => getJSON<EmployeeListRow[]>("/employees"),
-  employeeDesignations: () => getJSON<string[]>("/employees/designations"),
+  employeeDesignations: (deliveryOnly: boolean = false) =>
+    getJSON<string[]>(`/employees/designations${deliveryOnly ? "?delivery_only=true" : ""}`),
   allocations: () => getJSON<AllocationRow[]>("/allocations/current"),
   allocationTimesheet: (employeeId: string, projectId: string) =>
     getJSON<AllocationTimesheet>(`/allocations/timesheet?employee_id=${encodeURIComponent(employeeId)}&project_id=${encodeURIComponent(projectId)}`),
@@ -2461,6 +2536,8 @@ export const api = {
   getBudgetApprovals: () => getJSON<BudgetApprovalEntry[]>(`/projects/budget/approvals`),
   getBudgetDetail: (budgetId: string) => getJSON<BudgetDetail | null>(`/projects/budget/approvals/${encodeURIComponent(budgetId)}`),
   listProjectSow: (projectCode: string) => getJSON<SowFile[]>(`/projects/${encodeURIComponent(projectCode)}/sow`),
+  sowCompareBudget: (projectCode: string) =>
+    getJSON<SowBudgetComparison>(`/projects/${encodeURIComponent(projectCode)}/sow/compare-budget`),
   uploadProjectSow: async (projectCode: string, file: File): Promise<SowFile> => {
     const form = new FormData();
     form.append("file", file);
@@ -2490,6 +2567,8 @@ export const api = {
     postJSON<Record<string, string | null>>(`/projects/${encodeURIComponent(projectCode)}/kickoff`, { fields }),
   roleMixTemplates: () => getJSON<RoleMixTemplate[]>("/role-mix/templates"),
   roleMixCategories: () => getJSON<DocxCategoryRoleMix[]>("/role-mix/categories"),
+  roleMixTeamSizeFit: (projectCode: string, designations: string[]) =>
+    postJSON<TeamSizeFitResult>("/role-mix/team-size-fit", { project_code: projectCode, designations }),
   recommendationsForPipelineRow: (
     rowIndex: number, topN: number = 15, include: IncludeParams = DEFAULT_INCLUDE_PARAMS,
     includeBelowCapacity: boolean = false, nearCapacityTolerancePct: number = 25,
@@ -2645,7 +2724,7 @@ export const api = {
     if (opts.isConfirmed != null) params.set("is_confirmed", String(opts.isConfirmed));
     return getJSON<OutlookDrilldownResult>(`/forecast/six-month-outlook/drilldown?${params.toString()}`);
   },
-  freePool: () => getJSON<FreePoolCandidate[]>("/free-pool"),
+  freePool: (jmdOnly: boolean = false) => getJSON<FreePoolCandidate[]>(`/free-pool${jmdOnly ? "?jmd_only=true" : ""}`),
   freePoolMatches: (
     employeeId: string, topN = 20, include: IncludeParams = DEFAULT_INCLUDE_PARAMS,
     includeBelowCapacity: boolean = false, nearCapacityTolerancePct: number = 25
@@ -2808,6 +2887,7 @@ export interface HeadcountForecastRow {
   lower: number;
   upper: number;
   sample_months: number;
+  resignation_sample_months: number;
   low_confidence: boolean;
   forecast_new_hires: number;
   forecast_resignations: number;
@@ -2879,6 +2959,7 @@ export interface HeadcountPredictionResult {
   model_info: {
     type: string;
     sample_months: number;
+    resignation_sample_months: number;
     low_confidence: boolean;
     trained_on: string;
     note: string;

@@ -460,7 +460,7 @@ export default function HeadcountPredictionPage() {
             <StatCard
               label="Forecast Confidence"
               value={activeData.model_info.low_confidence ? "Low" : "OK"}
-              sub={`based on ${activeData.model_info.sample_months} real month(s) of departure data`}
+              sub={`hiring trend: ${activeData.model_info.sample_months} real mo. · departures: ${activeData.model_info.resignation_sample_months} real mo.`}
             />
           </div>
 

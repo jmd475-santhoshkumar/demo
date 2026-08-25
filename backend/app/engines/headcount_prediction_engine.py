@@ -12,11 +12,30 @@ by the REAL headcount for that month, not a synthetic series. Utilization
 (free pool / over- / under-allocated) reuses the same real functions the
 Allocations/Free Pool pages already use.
 
-Real employee departure records are extremely sparse (14 rows total across
-1050 employees, every one of them from 2026-05 onward) -- nowhere near enough
-to train or validate a statistical forecasting model. The forecast here is
-therefore a simple, explicitly low-confidence trailing-average net-change
-extrapolation (same honesty pattern as demand_forecast_service's
+Real employee departure DATES are entirely unpopulated (0 of 1127 employees
+have a date_of_resignation, confirmed against the live database) -- so exact
+departure timing is simply not tracked anywhere in this dataset. Current
+employment status is still knowable though: adapter.py's get_employees()
+already corrects the raw (unreliable) account_status column against the real,
+corroborated jin_id_status signal before this engine ever sees it -- see that
+method's own docstring for how/why. Two consequences, both handled explicitly
+rather than silently:
+  1. total_active_headcount cannot be reconstructed from resignation dates
+     (there are none), so it instead falls back to each employee's CURRENT
+     (adapter-corrected) account_status when no resignation date exists -- a
+     currently-departed employee is excluded from every month's count (a
+     survivorship-based reconstruction), rather than being counted as active
+     forever, which is what a naive resignation-date-only filter would
+     otherwise do once the dates are all missing.
+  2. Real month-by-month resignation counts are honestly always 0 (not a
+     trained rate), so the forecast's hiring component (real, complete data)
+     and its resignation component (real, but always-zero data) are modelled
+     with SEPARATE sample sizes/confidence -- a missing attrition signal
+     degrades the forecast's confidence label without also forcing the
+     hiring-driven growth trend itself to flatline to zero, which is what
+     gating the whole net-change on departure-data reliability used to do.
+The forecast is therefore a simple, explicitly low-confidence trailing-average
+net-change extrapolation (same honesty pattern as demand_forecast_service's
 get_financial_summary: a `low_confidence` flag + `sample_months`/`sample_size`
 reported alongside the number), not a machine-learned model with a fabricated
 accuracy claim.
@@ -95,6 +114,8 @@ def _real_monthly_history(months_back: int = HISTORY_MONTHS_BACK) -> list[dict]:
     joins = pd.to_datetime(employees["date_of_join"], errors="coerce")
     resigns = pd.to_datetime(employees["date_of_resignation"], errors="coerce")
     locations = employees["location"]
+    currently_active = employees["account_status"] == 1
+    has_known_resignation = resigns.notna()
     first_resignation = resigns.min()
     max_real_join_period = joins.max().to_period("M") if joins.notna().any() else None
 
@@ -194,12 +215,21 @@ def _real_monthly_history(months_back: int = HISTORY_MONTHS_BACK) -> list[dict]:
                     "day-by-day lateral hiring. Excluded from the steady-hiring baseline used elsewhere on this page."
                 )
 
-        # Headcount: real snapshot filter (exact per-employee join/resignation
-        # dates) for real months -- most accurate. Rolled forward from the last
-        # real month for gap months, since there's no real join-date roster left
-        # to filter against past that point.
+        # Headcount: real snapshot filter for real months -- most accurate.
+        # An employee counts as active for this month if they'd joined by
+        # month_end AND either (a) a real resignation date exists and it's
+        # after month_end, or (b) no resignation date exists but they ARE
+        # currently active (per the adapter-corrected account_status -- see
+        # module docstring). A currently-inactive employee with no recorded
+        # resignation date is excluded from every month rather than counted
+        # in all of them. Rolled forward from the last real month for gap
+        # months, since there's no real join-date roster left to filter
+        # against past that point.
         if not is_gap_month:
-            active_mask = joins.notna() & (joins <= month_end) & (resigns.isna() | (resigns > month_end))
+            active_mask = (
+                joins.notna() & (joins <= month_end)
+                & ((has_known_resignation & (resigns > month_end)) | (~has_known_resignation & currently_active))
+            )
             total_active = int(active_mask.sum())
             running_headcount = total_active
         else:
@@ -214,6 +244,7 @@ def _real_monthly_history(months_back: int = HISTORY_MONTHS_BACK) -> list[dict]:
             "net": new_hires - resignations,
             "hires_by_location": hires_by_location,
             "hires_estimated": hires_estimated,
+            "is_bulk_period": period in bulk_periods,
             "departures_data_reliable": departures_data_reliable,
             "note": note,
         })
@@ -252,34 +283,55 @@ def _real_utilization_snapshot() -> dict:
 
 
 def _real_trailing_forecast(history: list[dict], horizon_months: int) -> list[dict]:
-    reliable = [h for h in history if h["departures_data_reliable"]]
-    sample = reliable[-FORECAST_TRAILING_MONTHS:]
-    sample_months = len(sample)
-    sample_nets = [h["net"] for h in sample]
-    avg_net = (sum(sample_nets) / sample_months) if sample_months else 0.0
-    # Hires/resignations decomposed separately (not just net) so the Attrition
-    # & Retention chart can show a predicted continuation of EACH line, not
-    # just the combined headcount effect.
-    avg_hires = (sum(h["new_hires"] for h in sample) / sample_months) if sample_months else 0.0
-    avg_resignations = (sum(h["resignations"] for h in sample) / sample_months) if sample_months else 0.0
+    # Hiring history is real and complete for every month up to the real
+    # join-date ceiling (see _real_monthly_history) -- gap-filled/estimated
+    # months are excluded from the trailing sample so a filled-in guess never
+    # feeds back into the forecast as if it were an observed data point, and
+    # real annual bulk/intern-batch intake months are excluded too (same
+    # steady-lateral-hiring rationale _real_monthly_history already applies
+    # when estimating gap months) so one single-day cohort doesn't get
+    # projected forward as if it were the ongoing monthly hiring pace.
+    real_hire_months = [h for h in history if not h["hires_estimated"] and not h["is_bulk_period"]]
+    hires_sample = real_hire_months[-FORECAST_TRAILING_MONTHS:]
+    sample_months = len(hires_sample)
+    avg_hires = (sum(h["new_hires"] for h in hires_sample) / sample_months) if sample_months else 0.0
+
+    # Resignation DATES are real but, in the current real dataset, entirely
+    # unpopulated (see module docstring) -- sampled and gated SEPARATELY from
+    # hires so a missing attrition signal degrades only the resignation side
+    # of the forecast (and the overall low_confidence label), instead of also
+    # forcing the hiring-driven growth trend to flatline to zero the way a
+    # single combined "net" gate used to.
+    resignation_sample = [h for h in history if h["departures_data_reliable"]][-FORECAST_TRAILING_MONTHS:]
+    resignation_sample_months = len(resignation_sample)
+    avg_resignations = (
+        sum(h["resignations"] for h in resignation_sample) / resignation_sample_months
+        if resignation_sample_months else 0.0
+    )
+    avg_net = avg_hires - avg_resignations
+    low_confidence = resignation_sample_months < FORECAST_TRAILING_MONTHS
+
     # Predicted location split for the forecast months -- reuses the SAME
-    # trailing sample's real hires_by_location breakdown (already real-location-
-    # proportioned for gap months, see _real_monthly_history), not a separately
-    # invented distribution, so it's consistent with forecast_new_hires above.
+    # trailing hires sample's real hires_by_location breakdown (already real-
+    # location-proportioned for gap months, see _real_monthly_history), not a
+    # separately invented distribution, so it's consistent with
+    # forecast_new_hires above.
     location_totals: dict[str, int] = {}
-    for h in sample:
+    for h in hires_sample:
         for loc, cnt in (h.get("hires_by_location") or {}).items():
             location_totals[loc] = location_totals.get(loc, 0) + cnt
     location_total_sum = sum(location_totals.values())
     forecast_location_share = (
         {loc: cnt / location_total_sum for loc, cnt in location_totals.items()} if location_total_sum else {}
     )
-    # Range = real observed spread of the SAME trailing months feeding the point
-    # forecast (worst vs. best real net-change month), not a fabricated
-    # statistical confidence interval -- with only a handful of real months to
-    # go on, a made-up +/-X% band would just be a new invented number. min==max
-    # (a zero-width band) when there's only one real month to compare against,
-    # which is honest: no real variability has been observed yet.
+    # Range = real observed spread of the SAME trailing hire months feeding
+    # the point forecast (each month's own real hires minus its own real,
+    # possibly-zero resignations), not a fabricated statistical confidence
+    # interval -- with only a handful of real months to go on, a made-up
+    # +/-X% band would just be a new invented number. min==max (a zero-width
+    # band) when there's only one real month to compare against, which is
+    # honest: no real variability has been observed yet.
+    sample_nets = [h["new_hires"] - h["resignations"] for h in hires_sample]
     min_net = min(sample_nets) if sample_nets else 0.0
     max_net = max(sample_nets) if sample_nets else 0.0
 
@@ -301,7 +353,8 @@ def _real_trailing_forecast(history: list[dict], horizon_months: int) -> list[di
             "lower": round(min(running_lower, running_upper), 1),
             "upper": round(max(running_lower, running_upper), 1),
             "sample_months": sample_months,
-            "low_confidence": sample_months < FORECAST_TRAILING_MONTHS,
+            "resignation_sample_months": resignation_sample_months,
+            "low_confidence": low_confidence,
             "forecast_new_hires": round(avg_hires, 1),
             "forecast_resignations": round(avg_resignations, 1),
             "forecast_hires_by_location": {
@@ -419,9 +472,11 @@ def _compute_insights(history: list[dict], forecast: list[dict], coe: dict, util
         risk_flags.append({
             "severity": "info",
             "message": (
-                f"This forecast is a trailing-{FORECAST_TRAILING_MONTHS}-month average extrapolation, based on only "
-                f"{forecast[0]['sample_months']} real month(s) of departure data (real resignation records only start "
-                "2026-05) -- treat it as a rough scenario, not a validated prediction."
+                f"The hiring side of this forecast uses {forecast[0]['sample_months']} real trailing month(s) of "
+                f"actual join records, but only {forecast[0]['resignation_sample_months']} real month(s) have a "
+                "resignation DATE on file -- exact departure timing isn't tracked in this dataset, so the resignation "
+                "component is not a validated attrition rate. Treat the growth trend as hiring-driven, not "
+                "net-of-attrition."
             ),
         })
     # Scan the FULL displayed history, not just the most recent months -- an
@@ -522,6 +577,15 @@ def get_headcount_prediction(horizon_months: int = 12) -> dict:
     insights = _compute_insights(history, forecast, coe, utilization)
 
     sample_months = forecast[0]["sample_months"] if forecast else 0
+    resignation_sample_months = forecast[0]["resignation_sample_months"] if forecast else 0
+    low_confidence = forecast[0]["low_confidence"] if forecast else True
+
+    # Computed live (not hardcoded) so this note can never silently go stale
+    # the way a fixed "N rows" claim would the moment the underlying dataset
+    # is refreshed.
+    employees = get_adapter().get_employees()
+    real_resignation_dates = int(pd.to_datetime(employees["date_of_resignation"], errors="coerce").notna().sum())
+    departed_by_status = int((employees["account_status"] == 0).sum())
 
     return {
         "history": [
@@ -543,14 +607,20 @@ def get_headcount_prediction(horizon_months: int = 12) -> dict:
         "model_info": {
             "type": f"Trailing {FORECAST_TRAILING_MONTHS}-month average net-change extrapolation",
             "sample_months": sample_months,
-            "low_confidence": sample_months < FORECAST_TRAILING_MONTHS,
-            "trained_on": "Real employee join/resignation dates (app/core/adapter.py) -- no synthetic data.",
+            "resignation_sample_months": resignation_sample_months,
+            "low_confidence": low_confidence,
+            "trained_on": "Real employee join/resignation dates and account_status (app/core/adapter.py) -- no synthetic data.",
             "note": (
-                "Real resignation records only exist from 2026-05 onward (14 rows total across 1050 employees) -- "
-                "far too little history to fit or validate a statistical model. This forecast is a plain trailing-"
-                f"average of real net hiring over the last {sample_months} month(s) with real departure data, held "
-                "constant forward. Revenue and EBITDA margin are grounded in real JMAN FY26 P&L figures (fitted/"
-                "extrapolated), divided by the real headcount above -- not a synthetic denominator."
+                f"Real resignation DATE records: {real_resignation_dates} of {len(employees)} employees, even though "
+                f"{departed_by_status} are recorded as departed via account_status -- exact departure timing isn't "
+                "tracked in this dataset, so month-by-month resignation counts (and this forecast's resignation "
+                f"component, averaged over the last {resignation_sample_months} month(s) with a real departure date) "
+                "are honestly held at whatever the real data shows, never extrapolated from a rate this data can't "
+                f"support. Current and historical total_active_headcount instead falls back to account_status when no "
+                "resignation date exists, so departed employees are correctly excluded rather than counted forever. "
+                f"The hiring-driven growth trend itself is based on {sample_months} real trailing month(s) of actual "
+                "join records, which ARE complete. Revenue and EBITDA margin are grounded in real JMAN FY26 P&L "
+                "figures (fitted/extrapolated), divided by the real headcount above -- not a synthetic denominator."
             ),
         },
     }
@@ -575,6 +645,7 @@ def simulate_headcount_prediction(edited_history: list[dict], horizon_months: in
             "net": new_hires - resignations,
             "hires_by_location": row.get("hires_by_location") or {},
             "hires_estimated": bool(row.get("hires_estimated", False)),
+            "is_bulk_period": bool(row.get("is_bulk_period", False)),
             "departures_data_reliable": bool(row.get("departures_data_reliable", True)),
             "note": row.get("note"),
         })
@@ -587,6 +658,8 @@ def simulate_headcount_prediction(edited_history: list[dict], horizon_months: in
     forecast = _real_trailing_forecast(history, horizon_months)
     insights = _compute_insights(history, forecast, coe, utilization)
     sample_months = forecast[0]["sample_months"] if forecast else 0
+    resignation_sample_months = forecast[0]["resignation_sample_months"] if forecast else 0
+    low_confidence = forecast[0]["low_confidence"] if forecast else True
 
     return {
         "history": [
@@ -608,7 +681,8 @@ def simulate_headcount_prediction(edited_history: list[dict], horizon_months: in
         "model_info": {
             "type": f"Trailing {FORECAST_TRAILING_MONTHS}-month average net-change extrapolation (simulated scenario)",
             "sample_months": sample_months,
-            "low_confidence": sample_months < FORECAST_TRAILING_MONTHS,
+            "resignation_sample_months": resignation_sample_months,
+            "low_confidence": low_confidence,
             "trained_on": "Resource-manager-edited monthly history -- a what-if scenario, not the live real dataset.",
             "note": (
                 "This result reflects manually edited hires/resignations/headcount values, not live real data. "

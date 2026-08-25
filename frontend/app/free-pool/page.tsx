@@ -31,7 +31,7 @@ const SORT_OPTIONS: { value: Sort; label: string }[] = [
 ];
 
 export default function FreePoolPage() {
-  const { data, isLoading, error } = useQuery({ queryKey: ["free-pool"], queryFn: api.freePool });
+  const { data, isLoading, error } = useQuery({ queryKey: ["free-pool", "jmd"], queryFn: () => api.freePool(true) });
   const [filter, setFilter] = useState<Filter>("all");
   const [coeFilter, setCoeFilter] = useState<string>("all");
   const [search, setSearch] = useState("");
@@ -105,13 +105,13 @@ export default function FreePoolPage() {
   return (
     <div className="p-4 sm:p-6 w-full space-y-4">
       <p className="text-xs text-gray-500 dark:text-gray-400">
-        Who has spare capacity right now. Click anyone to see their profile and matching open pipeline roles.
+        Who has spare capacity right now, among JMD delivery staff. Click anyone to see their profile and matching open pipeline roles.
       </p>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard label="Fully Free" value={counts.fully_free} sub="no active allocation at all" color="green" />
-        <StatCard label="Under-Utilized" value={counts.under_utilized} sub="below 70% total allocation" color="blue" />
-        <StatCard label="Ending Soon" value={counts.ending_soon} sub="freeing up within 30 days" color="amber" />
+        <StatCard label="Fully Free" value={counts.fully_free} sub="0% real client work (may have internal/BAU tasks)" color="green" />
+        <StatCard label="Under-Utilized" value={counts.under_utilized} sub="below 70% real client allocation" color="blue" />
+        <StatCard label="Ending Soon" value={counts.ending_soon} sub="freeing up within 2 weeks" color="amber" />
         <StatCard
           label="Idle Capacity Value"
           value={formatUsd(totalIdleValue)}

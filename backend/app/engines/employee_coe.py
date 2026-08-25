@@ -1,3 +1,4 @@
+import duckdb
 import pandas as pd
 
 from app.core.adapter import get_adapter
@@ -20,17 +21,51 @@ def _fingerprint(skills_df: pd.DataFrame, experience_profiles: dict) -> tuple:
         len(experience_profiles),
     )
 
+def _real_jin_coe_map(adapter) -> dict[str, str]:
+    """Real per-employee CoE straight from the JIN data warehouse: stg_jin.users
+    (code, verticalId) joined to stg_jin.coe_config (id, verticalName) --
+    stored locally as coe_users/coe_config (see dataset_store.KNOWN_TABLES),
+    populated by either a live JDWH pull or a Settings-page upload.
+    `code` is that table's own employee identifier, joined against this app's
+    employee_id. Empty dict (not an error) whenever this data hasn't been
+    loaded yet -- including the DuckDB table not existing at all (see
+    app/core/db.py's _load_all: a table with no Postgres counterpart is never
+    created, so querying it raises CatalogException instead of just being
+    empty). Every caller below already treats "no real CoE" as expected."""
+    try:
+        users = adapter.get_coe_users()
+        config = adapter.get_coe_config()
+    except duckdb.Error:
+        return {}
+    if users.empty or config.empty:
+        return {}
+    users = users.dropna(subset=["code"])
+    name_by_vertical_id = dict(zip(config["id"].astype(str), config["verticalname"]))
+    result: dict[str, str] = {}
+    for code, vertical_id in zip(users["code"].astype(str), users["verticalid"].astype(str)):
+        name = name_by_vertical_id.get(vertical_id)
+        if name and pd.notna(name):
+            result[code] = _canonicalize(str(name))
+    return result
+
+
 def get_employee_primary_coe_map() -> dict[str, str]:
     """Real employees' primary Centre of Excellence, one label per employee.
 
-    Prefers each employee's REAL project-allocation history (tech_coe_breakdown
-    from experience_engine.build_employee_experience_profiles() -- the same
-    real per-project CoE tags used everywhere else in this app) -- their
-    single most-worked real CoE. Only falls back to the skills table for
-    anyone with no real allocation history at all -- for most employees that
-    table isn't really their own data anyway: it's a same-designation
-    synthetic stand-in's skill profile (see skill_mapping_service.py's module
-    docstring), not a claim about that specific person.
+    Priority order:
+    1. The real JIN data warehouse mapping (stg_jin.users/coe_config, see
+       _real_jin_coe_map) -- an actual, authoritative CoE assignment, not a
+       guess. Used whenever it covers a given employee.
+    2. Each employee's REAL project-allocation history (tech_coe_breakdown
+       from experience_engine.build_employee_experience_profiles() -- the same
+       real per-project CoE tags used everywhere else in this app) -- their
+       single most-worked real CoE. Only reached for employees the JIN
+       mapping doesn't cover.
+    3. The skills table, only for anyone with no real allocation history
+       either -- for most employees that table isn't really their own data
+       anyway: it's a same-designation synthetic stand-in's skill profile
+       (see skill_mapping_service.py's module docstring), not a claim about
+       that specific person.
 
     This ordering matters in practice, not just in theory: confirmed on real
     data that 693/901 employees have real allocation history to derive a
@@ -46,13 +81,17 @@ def get_employee_primary_coe_map() -> dict[str, str]:
 
     adapter = get_adapter()
     skills = adapter.get_skills()
+    jin_coe = _real_jin_coe_map(adapter)
     experience_profiles = build_employee_experience_profiles()
-    fingerprint = _fingerprint(skills, experience_profiles)
+    fingerprint = _fingerprint(skills, experience_profiles) + (len(jin_coe), hash(frozenset(jin_coe.items())))
     if _cache is not None and fingerprint == _cache_fingerprint:
         return _cache
 
-    result: dict[str, str] = {}
+    result: dict[str, str] = dict(jin_coe)
+
     for emp_id, profile in experience_profiles.items():
+        if emp_id in result:
+            continue
         breakdown = profile.get("tech_coe_breakdown") or {}
         if not breakdown:
             continue

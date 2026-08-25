@@ -23,7 +23,7 @@ from app.core import db as db_module
 from app.engines.role_mix_engine import canonical_project_coe
 from app.services.project_extension_history_service import record_extension
 
-ENDING_SOON_DAYS = 30
+ENDING_SOON_DAYS = 14
 OVER_ALLOCATED_THRESHOLD = 100
 UNDER_UTILIZED_THRESHOLD = 70
 STANDARD_HOURS_PER_DAY = 8
@@ -271,7 +271,7 @@ def update_allocation(
     Resource Allocation step lets an RM fill in for a not-yet-assigned row,
     now editable after the fact too instead of being frozen the moment it's
     saved. Full-replace semantics (every field is required) rather than
-    partial-patch -- the caller always has the complete current row already
+    partial-patch -- the caller always has the complete current row already 
     loaded, so there's no ambiguity about "not provided" vs "cleared"."""
     if not (0 < allocation_pct <= 100):
         raise ValueError("allocation_pct must be between 0 and 100")

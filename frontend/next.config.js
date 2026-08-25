@@ -1,15 +1,14 @@
 /** @type {import('next').NextConfig} */
-const BACKEND_URL = process.env.BACKEND_URL || "http://127.0.0.1:8000";
-
 const nextConfig = {
   // Produces .next/standalone: a minimal server.js + only the node_modules
   // this app actually needs at runtime, traced from its real imports --
   // needed for a lean Docker image (without this, the image would have to
   // ship the full node_modules tree). Doesn't change dev behavior at all.
   output: "standalone",
-  async rewrites() {
-    return [{ source: "/api/:path*", destination: `${BACKEND_URL}/:path*` }];
-  },
+  // /api/* is proxied to BACKEND_URL by app/api/[...path]/route.ts, not a
+  // rewrite here -- a next.config.js rewrite is resolved once at build time
+  // and baked into the image, so BACKEND_URL set at container start would
+  // be silently ignored.
   webpack: (config) => {
     // pdfjs-dist (used for the pixel-perfect SOW preview) probes for the
     // optional Node-only `canvas`/`encoding` packages even though it never

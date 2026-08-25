@@ -29,8 +29,8 @@ def list_all() -> list[dict]:
     return list_employees()
 
 @router.get("/designations")
-def designations() -> list[str]:
-    return list_designations()
+def designations(delivery_only: bool = False) -> list[str]:
+    return list_designations(delivery_only)
 
 @router.get("/groups")
 def employee_groups() -> list[str]:

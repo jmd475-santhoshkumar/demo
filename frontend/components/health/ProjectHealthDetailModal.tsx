@@ -717,6 +717,12 @@ function StaffingTab({ d }: { d: ProjectHealthDetail }) {
     return flex;
   };
 
+  const missingHeadcount = typicalRoles.reduce(
+    (sum, r) => sum + (isShortFor(r.designation) ? expectedHeadcountFor(r.designation) : 0),
+    0
+  );
+  const filledHeadcount = Math.round(d.understaffed.expected_headcount ?? 0) - missingHeadcount;
+
   let roleRows = allRoles;
   const rq = roleSearch.trim().toLowerCase();
   if (rq) roleRows = roleRows.filter((r) => r.toLowerCase().includes(rq));
@@ -812,12 +818,12 @@ function StaffingTab({ d }: { d: ProjectHealthDetail }) {
             </div>
             <span className="text-gray-300 dark:text-gray-600">=</span>
             <div className="flex items-baseline gap-1">
-              <span className="text-lg font-bold text-emerald-600 dark:text-emerald-400">{actualInTypicalRoles}</span>
+              <span className="text-lg font-bold text-emerald-600 dark:text-emerald-400">{filledHeadcount}</span>
               <span className="text-[11px] text-gray-500 dark:text-gray-400">filled</span>
             </div>
             <span className="text-gray-300 dark:text-gray-600">+</span>
             <div className="flex items-baseline gap-1">
-              <span className="text-lg font-bold text-red-600 dark:text-red-400">{Math.round(d.understaffed.expected_headcount) - actualInTypicalRoles}</span>
+              <span className="text-lg font-bold text-red-600 dark:text-red-400">{missingHeadcount}</span>
               <span className="text-[11px] text-gray-500 dark:text-gray-400">missing</span>
             </div>
           </div>
@@ -825,8 +831,10 @@ function StaffingTab({ d }: { d: ProjectHealthDetail }) {
         {d.understaffed.role_mix_source === "real_budget" ? (
           <>
             <p className="text-[11px] text-gray-500 dark:text-gray-400 mb-1">
-              Those {Math.round(d.understaffed.expected_headcount ?? 0)} &quot;needed&quot;/&quot;filled&quot; are exactly the {typicalRoles.length} roles budgeted
-              for this project. Separately, <strong>{d.understaffed.actual_headcount_active_now}</strong> people total are on this
+              Those {Math.round(d.understaffed.expected_headcount ?? 0)} &quot;needed&quot; are the {typicalRoles.length} roles budgeted
+              for this project, after accounting for flex coverage (a role covered by a spare person from an adjacent level
+              counts as &quot;filled&quot;, not &quot;missing&quot; — see &quot;Covered (flex)&quot; rows below). Separately,{" "}
+              <strong>{d.understaffed.actual_headcount_active_now}</strong> people total are on this
               project right now{actualOutsideTypicalRoles > 0 && (
                 <> — {actualInTypicalRoles} of them in a budgeted role, the other {actualOutsideTypicalRoles} in {actualOutsideTypicalRoles === 1 ? "a role" : "roles"} not in the real budget plan (see &quot;Not budgeted&quot; rows)</>
               )}.
@@ -839,8 +847,10 @@ function StaffingTab({ d }: { d: ProjectHealthDetail }) {
         ) : (
           <>
             <p className="text-[11px] text-gray-500 dark:text-gray-400 mb-1">
-              Those {Math.round(d.understaffed.expected_headcount ?? 0)} &quot;needed&quot;/&quot;filled&quot; only count the {typicalRoles.length} typical
-              roles below. Separately, <strong>{d.understaffed.actual_headcount_active_now}</strong> people total are on this
+              Those {Math.round(d.understaffed.expected_headcount ?? 0)} &quot;needed&quot; only count the {typicalRoles.length} typical
+              roles below, after accounting for flex coverage (a role covered by a spare person from an adjacent level
+              counts as &quot;filled&quot;, not &quot;missing&quot; — see &quot;Covered (flex)&quot; rows). Separately,{" "}
+              <strong>{d.understaffed.actual_headcount_active_now}</strong> people total are on this
               project right now{actualOutsideTypicalRoles > 0 && (
                 <> — {actualInTypicalRoles} of them in a typical role, the other {actualOutsideTypicalRoles} in {actualOutsideTypicalRoles === 1 ? "a role" : "roles"} this project doesn&apos;t usually use (see &quot;Not typical&quot; rows)</>
               )}.

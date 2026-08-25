@@ -10,8 +10,13 @@ from app.ai.providers.base import QuotaExceededError
 from app.core.adapter import get_adapter
 from app.core.db import ReadOnlyQueryError, get_schema_description, run_readonly_query
 from app.engines.coe_skill_engine import derive_skills_for_coes
+from app.engines.feedback_engine import get_employee_feedback
+from app.engines.headcount_prediction_engine import get_headcount_prediction
+from app.engines.performance_engine import list_employee_cycles
+from app.engines.pulse_engine import get_employee_all_pulse_responses
 from app.engines.role_hierarchy import adjacent_designations
 from app.engines.role_mix_engine import (
+    analyze_team_size_fit,
     get_role_mix,
     get_role_mix_by_category,
     get_role_mix_by_coes,
@@ -27,10 +32,17 @@ from app.services.employee_profile_service import (
     get_employee_profile,
 )
 from app.services.free_pool_service import get_free_pool
+from app.services.governance_service import get_cluster_dashboard, list_clusters
 from app.services.health_detail_service import ProjectNotFound, get_project_health_detail, get_relief_staffing_candidates
-from app.services.health_monitor_service import get_health_report
-from app.services.leave_service import get_leave_impact
+from app.services.health_monitor_service import get_health_report, get_project_wsr_sentiment
+from app.services.jin_budget_service import get_project_actual_vs_planned
+from app.services.leave_service import get_leave_impact, get_project_alumni_candidates
+from app.services.performance_summary_service import get_performance_ai_summary
 from app.services.pipeline_outlook_service import get_pipeline_outlook, get_pipeline_outlook_drilldown, get_six_month_outlook
+from app.services.project_budget_service import get_budget
+from app.services.project_extension_history_service import get_extension_history
+from app.services.project_gdpr_service import get_gdpr
+from app.services.project_kickoff_service import get_kickoff
 from app.services.project_roster_service import get_project_info, get_project_roster
 from app.services.rate_card_service import get_rate_card
 from app.services.recommendation_service import (
@@ -64,8 +76,12 @@ SYSTEM_PROMPT = """You are the ResourceIQ copilot for JMAN's Resource Management
 You have full read access to every real engine in this app -- staffing recommendations,
 free pool/redeployment, leave impact, employee profiles, project health/risk proof,
 allocations/utilization, new-project demand forecasts, the flexible pipeline outlook,
-role-mix/CoE/rate-card reference data, and timesheet-derived signals -- by calling the
-available tools. Never guess or invent a number, an employee_id, or a project_code.
+role-mix/CoE/rate-card reference data, timesheet-derived signals, HR/PM feedback, formal
+KRA performance reviews, weekly wellbeing Pulse surveys, Cluster Governance (the live
+replacement for the weekly JQA deck), headcount-trend prediction, project budgets/kickoff/
+GDPR/extension-history records, team-size-fit precedent checks, WSR sentiment, and project
+alumni backfill candidates -- by calling the available tools. Never guess or invent a
+number, an employee_id, or a project_code.
 Today's reference date is the system date; if a question implies "now" or doesn't give a
 date, use current date as a reasonable near-term default for staffing questions.
 
@@ -128,12 +144,36 @@ for "why" or "what should I do" questions):
   just the sample shown to you. If shown_count < total_count, say so explicitly (e.g.
   "111 employees are fully free; showing the first 25 below") rather than silently citing
   the smaller number. Several tools also return exact breakdown counts computed over the
-  FULL population alongside the capped sample -- get_free_pool's reason_counts, get_health_report's
-  risk_band_counts, get_allocation_report's utilization_band_counts/ending_soon_count,
-  get_leave_impact's currently_on_leave_count/no_backfill_count. Always answer a "how many
-  are X" question using the matching exact count field when one is present, never by
-  counting matches within the truncated items sample -- the sample is not representative
+  FULL population alongside the capped sample -- get_free_pool's reason_counts/on_hold_count,
+  get_health_report's risk_band_counts, get_allocation_report's utilization_band_counts/
+  ending_soon_count, get_leave_impact's currently_on_leave_count/no_backfill_count. Always
+  answer a "how many are X" question using the matching exact count field when one is
+  present, NEVER by writing your own query_database SQL for something an existing tool's
+  result already gives you exactly -- a hand-written aggregate query risks a different,
+  inconsistent denominator/definition than the one the rest of your answer is built on.
+  Never counting matches within the truncated items sample either -- the sample is not representative
   (it may be sorted, capped, or arbitrarily ordered) and counting within it WILL be wrong.
+- For "how is <person> doing / any concerns about them" questions, distinguish the THREE
+  separate signals rather than treating them as one: get_employee_feedback (informal
+  per-project HR/PM ratings and comments), get_employee_performance_summary (formal
+  half-yearly KRA appraisal cycles), and get_employee_pulse (self-reported weekly
+  wellbeing, 1-4 scale, is_not_happy flag) -- call whichever ones the question actually
+  implies, and never blend one signal's numbers into another's summary.
+- For "what's the governance status of cluster N / of <client>'s cluster" questions, call
+  get_governance_clusters first if you only have a name (Ganges/Tigris/Kauveri/Patapsco/
+  Mississippi) and need the numeric cluster_number, then get_cluster_governance_detail.
+  Cite real project names/counts from its projects, open_risks, spotlight, kickoff_this_week,
+  and ending_this_week lists and the wsr_status Red/Amber/Green counts -- never invent a
+  risk or a project not present in the result.
+- For get_team_size_fit, the designations list must be the CURRENT real team's designations
+  -- get it from get_project_roster (active rows only) if the user hasn't already stated the
+  team composition in this conversation; never invent designations.
+- get_free_pool results include on_hold/hold_projects fields: an employee can look fully
+  free on paper but sit on a project flagged for likely extension -- always mention on_hold
+  people explicitly rather than presenting them as unconditionally available.
+- get_project_kickoff_status and get_project_gdpr_status return null/None fields when
+  nothing has been logged yet for that project -- report that plainly as "not logged", never
+  as "no" or "not completed" (those are a different, stronger claim than "not tracked").
 - If NONE of the tools above can answer the question (an unusual aggregation, a filter or
   breakdown nothing else exposes, a cross-table join, a one-off count) -- do not just say
   you can't help. Use query_database as a last resort: write a single read-only SQL SELECT/
@@ -430,6 +470,133 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {}},
     },
     {
+        "name": "get_employee_feedback",
+        "description": "HR/PM feedback history for one employee across past project engagements: star ratings (1-5), theme averages, would-recommend %, and reviewer comments. Distinct from get_employee_performance_summary (formal half-yearly KRA appraisals) and get_employee_pulse (self-reported weekly wellbeing). Requires a real employee_id.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "employee_id": {"type": "string"},
+                "weeks_back": {"type": "integer", "description": "Only feedback from the last N weeks"},
+                "coe": {"type": "string", "description": "Filter to feedback from a project with this tech CoE"},
+                "project_id": {"type": "string"},
+                "theme": {"type": "string", "description": "Only reviews covering this theme"},
+            },
+            "required": ["employee_id"],
+        },
+    },
+    {
+        "name": "get_employee_performance_summary",
+        "description": "Formal half-yearly KRA/appraisal review history for one employee: every past cycle's label/status/rating, plus an AI one-line summary of the latest closed cycle's Projects/Products KRAs and overall feedback. Distinct from get_employee_feedback (informal per-project HR/PM check-ins). Requires a real employee_id.",
+        "parameters": {
+            "type": "object",
+            "properties": {"employee_id": {"type": "string"}},
+            "required": ["employee_id"],
+        },
+    },
+    {
+        "name": "get_employee_pulse",
+        "description": "One employee's real weekly Pulse survey history (5 questions, 1-4 scale, captured at timesheet submission) with an is_not_happy flag per week -- the self-reported wellbeing signal behind the Wellbeing page's 'not happy' list. Distinct from overtime-risk (a workload signal, not a sentiment one). Requires a real employee_id.",
+        "parameters": {
+            "type": "object",
+            "properties": {"employee_id": {"type": "string"}},
+            "required": ["employee_id"],
+        },
+    },
+    {
+        "name": "get_governance_clusters",
+        "description": "The 5 real client-delivery governance clusters (Ganges/Tigris/Kauveri/Patapsco/Mississippi) with their assigned project counts -- the live in-app replacement for the weekly JQA governance PowerPoint. Call this first to get a cluster_number before calling get_cluster_governance_detail.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_cluster_governance_detail",
+        "description": "Full current-week governance dashboard for one cluster: its real project list, logged + AI-flagged risks, this-week 'spotlight' top-projects for review, kick-off-this-week and ending/extending-this-week project lists, a Red/Amber/Green WSR breakdown, and a short AI call-summary. Use for 'what's the governance status of cluster N / which clients' style questions. Requires cluster_number (1-5, from get_governance_clusters).",
+        "parameters": {
+            "type": "object",
+            "properties": {"cluster_number": {"type": "integer", "description": "1-5"}},
+            "required": ["cluster_number"],
+        },
+    },
+    {
+        "name": "get_headcount_prediction",
+        "description": "Trailing-average total-headcount forecast (hires vs. resignations trend, by month) with a low_confidence flag on the model -- an org-wide staffing trend view, distinct from get_new_project_forecast's skill-based per-deal headcount math. Use for 'what will our headcount look like in N months' style questions.",
+        "parameters": {
+            "type": "object",
+            "properties": {"horizon_months": {"type": "integer", "description": "Defaults to 12"}},
+        },
+    },
+    {
+        "name": "get_project_budget",
+        "description": "One project's real budget: the draft line-item budget (designation, allocation %, day rate) built in Budget Creation, plus -- if a JIN budget was actually approved -- a planned-vs-actual staffing comparison by designation. Requires a real project_code.",
+        "parameters": {
+            "type": "object",
+            "properties": {"project_code": {"type": "string"}},
+            "required": ["project_code"],
+        },
+    },
+    {
+        "name": "get_project_kickoff_status",
+        "description": "Whether a project's internal kick-off checklist was completed (client background review, stakeholder plan, team roles, ways of working, etc.) -- null fields mean never logged, not 'no'. Requires a real project_code.",
+        "parameters": {
+            "type": "object",
+            "properties": {"project_code": {"type": "string"}},
+            "required": ["project_code"],
+        },
+    },
+    {
+        "name": "get_project_gdpr_status",
+        "description": "One project's real GDPR/data-protection record: personal data collected, legal basis, retention period, DPA signed. Returns null if never logged for this project. Requires a real project_code.",
+        "parameters": {
+            "type": "object",
+            "properties": {"project_code": {"type": "string"}},
+            "required": ["project_code"],
+        },
+    },
+    {
+        "name": "get_project_extension_history",
+        "description": "The full append-only log of every end-date extension ever recorded for a project (from -> to date, when, status) -- use this instead of just the current end date for 'how many times has this project been extended' style questions. Requires a real project_code.",
+        "parameters": {
+            "type": "object",
+            "properties": {"project_code": {"type": "string"}},
+            "required": ["project_code"],
+        },
+    },
+    {
+        "name": "get_team_size_fit",
+        "description": "Checks whether a given team headcount/composition for a project is supported by real precedent projects (clean vs. escalated/extended outcomes at different team sizes), returning a sufficient/add-one/remove-one verdict with the specific role to change and an AI-explained rationale. Requires a real project_code and the list of current team designations.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_code": {"type": "string"},
+                "designations": {"type": "array", "items": {"type": "string"}, "description": "One designation string per current team member"},
+            },
+            "required": ["project_code", "designations"],
+        },
+    },
+    {
+        "name": "get_project_sentiment",
+        "description": "Sentiment analysis of a project's real Weekly Status Report (WSR) comments over its last N reports: trend (improving/deteriorating/stable), latest comment, and per-report scores. Distinct from get_project_health_detail's already-fired structural risk root causes -- this is language-tone signal only. Requires a real project_code.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_code": {"type": "string"},
+                "last_n": {"type": "integer", "description": "Defaults to 8"},
+            },
+            "required": ["project_code"],
+        },
+    },
+    {
+        "name": "get_project_alumni",
+        "description": "Real employees who previously worked this exact project but aren't on it now -- fast, already-ramped-up backfill candidates, distinct from a fresh skill-matched search (get_recommendations/get_relief_staffing_candidates). Requires a real project_code.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_code": {"type": "string"},
+                "exclude_employee_id": {"type": "string"},
+            },
+            "required": ["project_code"],
+        },
+    },
+    {
         "name": "query_database",
         "description": (
             "LAST RESORT ONLY -- use this when none of the other tools above can answer the question "
@@ -572,6 +739,46 @@ def _dispatch(name: str, args: dict):
         return info if info is not None else {"error": f"project {args.get('project_code')} not found"}
     if name == "get_revenue_trend":
         return get_revenue_trend()
+    if name == "get_employee_feedback":
+        return get_employee_feedback(
+            args.get("employee_id", ""),
+            weeks_back=args.get("weeks_back"),
+            coe=args.get("coe"),
+            project_id=args.get("project_id"),
+            theme=args.get("theme"),
+        )
+    if name == "get_employee_performance_summary":
+        emp_id = args.get("employee_id", "")
+        return {"ai_summary": get_performance_ai_summary(emp_id), "cycles": list_employee_cycles(emp_id)}
+    if name == "get_employee_pulse":
+        return get_employee_all_pulse_responses(args.get("employee_id", ""))
+    if name == "get_governance_clusters":
+        return list_clusters()
+    if name == "get_cluster_governance_detail":
+        try:
+            result = get_cluster_dashboard(int(args.get("cluster_number", -1)))
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return result if result is not None else {"error": "no data captured for this cluster/week"}
+    if name == "get_headcount_prediction":
+        return get_headcount_prediction(int(args.get("horizon_months", 12)))
+    if name == "get_project_budget":
+        code = args.get("project_code", "")
+        return {"draft_budget": get_budget(code), "actual_vs_planned": get_project_actual_vs_planned(code)}
+    if name == "get_project_kickoff_status":
+        result = get_kickoff(args.get("project_code", ""))
+        return result if result is not None else {"error": "no kickoff checklist logged for this project"}
+    if name == "get_project_gdpr_status":
+        result = get_gdpr(args.get("project_code", ""))
+        return result if result is not None else {"error": "no GDPR record logged for this project"}
+    if name == "get_project_extension_history":
+        return get_extension_history(args.get("project_code", ""))
+    if name == "get_team_size_fit":
+        return analyze_team_size_fit(args.get("project_code", ""), args.get("designations", []))
+    if name == "get_project_sentiment":
+        return get_project_wsr_sentiment(args.get("project_code", ""), int(args.get("last_n", 8)))
+    if name == "get_project_alumni":
+        return get_project_alumni_candidates(args.get("project_code", ""), args.get("exclude_employee_id"))
     if name == "query_database":
         try:
             return run_readonly_query(args.get("sql", ""))
@@ -666,7 +873,8 @@ def _truncate_for_llm(name: str, result):
         reason_counts: dict[str, int] = {}
         for r in result:
             reason_counts[r["reason"]] = reason_counts.get(r["reason"], 0) + 1
-        return _capped(result, 25, extra={"reason_counts": reason_counts})
+        on_hold_count = sum(1 for r in result if r.get("on_hold"))
+        return _capped(result, 25, extra={"reason_counts": reason_counts, "on_hold_count": on_hold_count})
     if name == "get_leave_impact" and isinstance(result, list):
         return _capped(
             result, 20,
@@ -699,6 +907,26 @@ def _truncate_for_llm(name: str, result):
         return {**result, "daily_hours": result.get("daily_hours", [])[-30:]}
     if name == "get_project_roster" and isinstance(result, dict):
         return {**result, "roster": _capped(result.get("roster", []), 20)}
+    if name == "get_employee_feedback" and isinstance(result, dict):
+        return {**result, "entries": _capped(result.get("entries", []), 10)}
+    if name == "get_employee_performance_summary" and isinstance(result, dict):
+        return {**result, "cycles": _capped(result.get("cycles", []), 10)}
+    if name == "get_cluster_governance_detail" and isinstance(result, dict) and "projects" in result:
+        return {
+            **result,
+            "projects": _capped(result.get("projects", []), 20),
+            "open_risks": _capped(result.get("open_risks", []), 15),
+            "synthetic_risks": _capped(result.get("synthetic_risks", []), 15),
+            "spotlight": _capped(result.get("spotlight", []), 10),
+            "kickoff_this_week": _capped(result.get("kickoff_this_week", []), 15),
+            "ending_this_week": _capped(result.get("ending_this_week", []), 15),
+        }
+    if name == "get_headcount_prediction" and isinstance(result, dict):
+        return {**result, "history": _capped(result.get("history", []), 15), "forecast": _capped(result.get("forecast", []), 15)}
+    if name == "get_project_extension_history" and isinstance(result, list):
+        return _capped(result, 15)
+    if name == "get_project_alumni" and isinstance(result, list):
+        return _capped(result, 15)
     if name == "query_database" and isinstance(result, dict) and "rows" in result:
         # The model only needs enough rows to read/verify the shape of its own
         # query result -- the fuller run_readonly_query cap (200) is preserved
@@ -783,12 +1011,13 @@ def _outlook_table(data) -> dict | None:
 def _free_pool_table(data) -> dict | None:
     if not isinstance(data, list) or not data:
         return None
-    columns = ["Employee", "Designation", "CoE", "Status", "Idle %", "Idle $/mo"]
+    columns = ["Employee", "Designation", "CoE", "Status", "Idle %", "Idle $/mo", "On hold"]
     rows = [
         [
             c.get("employee_id"), c.get("job_name") or "-", c.get("primary_coe") or "not determined",
             c.get("reason"), f"{c.get('idle_capacity_pct', 0):.0f}%",
             f"${c['idle_value_usd_per_month']:,.0f}" if c.get("idle_value_usd_per_month") is not None else "non-billable",
+            "Yes" if c.get("on_hold") else "No",
         ]
         for c in data[:10]
     ]
@@ -919,6 +1148,71 @@ def _revenue_table(data) -> dict | None:
     rows = [[r.get("month"), f"${r.get('value', 0):,.0f}"] for r in data]
     return {"columns": columns, "rows": rows}
 
+def _feedback_table(data) -> dict | None:
+    entries = (data or {}).get("entries") if isinstance(data, dict) else None
+    if not entries:
+        return None
+    columns = ["Project", "Reviewer role", "Rating", "Would recommend", "Themes", "Comment"]
+    rows = [
+        [
+            e.get("project_id") or "-", e.get("reviewer_role") or "-", e.get("rating"),
+            "Yes" if e.get("would_recommend") else "No", ", ".join(e.get("themes", [])) or "-",
+            e.get("summary_comment") or "-",
+        ]
+        for e in entries[:10]
+    ]
+    return {"columns": columns, "rows": rows}
+
+def _performance_cycles_table(data) -> dict | None:
+    cycles = (data or {}).get("cycles") if isinstance(data, dict) else None
+    if not cycles:
+        return None
+    columns = ["Cycle", "Status", "Rating", "Total score", "Published"]
+    rows = [
+        [c.get("cycle_label") or "-", c.get("status") or "-", c.get("performance_rating_label") or "-", c.get("total_score"), c.get("published_on") or "-"]
+        for c in cycles[:10]
+    ]
+    return {"columns": columns, "rows": rows}
+
+def _governance_clusters_table(data) -> dict | None:
+    if not isinstance(data, list) or not data:
+        return None
+    columns = ["Cluster #", "Name", "Projects"]
+    rows = [[c.get("number"), c.get("name"), c.get("project_count")] for c in data]
+    return {"columns": columns, "rows": rows}
+
+def _extension_history_table(data) -> dict | None:
+    if not isinstance(data, list) or not data:
+        return None
+    columns = ["Recorded", "From end date", "To end date", "Status"]
+    rows = [[r.get("recorded_at") or "-", r.get("from_end_date") or "-", r.get("to_end_date") or "-", r.get("status") or "-"] for r in data[:15]]
+    return {"columns": columns, "rows": rows}
+
+def _project_alumni_table(data) -> dict | None:
+    if not isinstance(data, list) or not data:
+        return None
+    columns = ["Employee", "Role", "Free now?", "Most recent end date"]
+    rows = [[a.get("employee_id"), a.get("job_name") or "-", "Yes" if a.get("is_currently_free") else "No", a.get("most_recent_end_date") or "-"] for a in data[:15]]
+    return {"columns": columns, "rows": rows}
+
+def _project_budget_table(data) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    draft = (data.get("draft_budget") or {}).get("line_items") if data.get("draft_budget") else None
+    if draft:
+        columns = ["Designation", "Location", "Allocation %", "Working days"]
+        rows = [[li.get("designation"), li.get("location") or "-", li.get("allocation_pct"), li.get("working_days")] for li in draft[:15]]
+        return {"columns": columns, "rows": rows}
+    comparison = (data.get("actual_vs_planned") or {}).get("comparison") if data.get("actual_vs_planned") else None
+    if comparison:
+        columns = ["Designation", "Planned count", "Planned alloc %", "Actual headcount", "Actual alloc %"]
+        rows = [
+            [c.get("designation"), c.get("planned_line_count"), c.get("planned_avg_allocation_pct"), c.get("actual_headcount"), c.get("avg_allocation_pct")]
+            for c in comparison[:15]
+        ]
+        return {"columns": columns, "rows": rows}
+    return None
+
 def _query_database_table(data) -> dict | None:
     if not isinstance(data, dict) or "columns" not in data or "rows" not in data or not data["rows"]:
         return None
@@ -944,6 +1238,12 @@ _TABLE_BUILDERS = {
     "get_allocation_timesheet": _timesheet_table,
     "get_project_roster": _roster_table,
     "get_revenue_trend": _revenue_table,
+    "get_employee_feedback": _feedback_table,
+    "get_employee_performance_summary": _performance_cycles_table,
+    "get_governance_clusters": _governance_clusters_table,
+    "get_project_extension_history": _extension_history_table,
+    "get_project_alumni": _project_alumni_table,
+    "get_project_budget": _project_budget_table,
     "query_database": _query_database_table,
 }
 
@@ -1045,6 +1345,65 @@ def _project_info_stats(data) -> list[dict] | None:
         {"label": "End", "value": data.get("project_end_date") or "-"},
     ]
 
+def _sentiment_stats(data) -> list[dict] | None:
+    if not isinstance(data, dict) or "has_data" not in data:
+        return None
+    if not data.get("has_data"):
+        return [{"label": "WSR sentiment", "value": "no WSR comments logged for this project"}]
+    return [
+        {"label": "Latest sentiment", "value": data.get("label") or "-"},
+        {"label": "Trend", "value": data.get("trend") or "-"},
+        {"label": "Risk signal", "value": data.get("risk_signal") or "-"},
+    ]
+
+def _cluster_detail_stats(data) -> list[dict] | None:
+    if not isinstance(data, dict) or "wsr_status" not in data:
+        return None
+    wsr = data["wsr_status"] or {}
+    return [
+        {"label": "Projects in cluster", "value": str(len(data.get("projects", [])))},
+        {"label": "WSR Red / Amber / Green", "value": f"{len(wsr.get('RED', []))} / {len(wsr.get('AMBER', []))} / {len(wsr.get('GREEN', []))}"},
+        {"label": "Open risks", "value": str(len(data.get("open_risks", [])))},
+        {"label": "Kicking off this week", "value": str(len(data.get("kickoff_this_week", [])))},
+        {"label": "Ending/extending this week", "value": str(len(data.get("ending_this_week", [])))},
+    ]
+
+def _headcount_prediction_stats(data) -> list[dict] | None:
+    if not isinstance(data, dict) or "model_info" not in data:
+        return None
+    forecast = data.get("forecast") or []
+    next_month = forecast[0] if forecast else {}
+    return [
+        {"label": "Horizon (months)", "value": str(data.get("horizon_months", "-"))},
+        {"label": "Next month forecast", "value": str(next_month.get("total_active_headcount", "-"))},
+        {"label": "Low confidence model?", "value": "Yes" if data.get("model_info", {}).get("low_confidence") else "No"},
+    ]
+
+def _team_size_fit_stats(data) -> list[dict] | None:
+    if not isinstance(data, dict) or "recommendation" not in data:
+        return None
+    return [
+        {"label": "Current headcount", "value": str(data.get("current_headcount", "-"))},
+        {"label": "Recommendation", "value": str(data.get("recommendation"))},
+        {"label": "Suggested role change", "value": data.get("suggested_role") or "-"},
+    ]
+
+def _kickoff_stats(data) -> list[dict] | None:
+    if not isinstance(data, dict) or "held_internal_session" not in data:
+        return None
+    checklist = [k for k in data if k.startswith("covered_") or k in ("held_internal_session", "used_internal_materials")]
+    done = sum(1 for k in checklist if str(data.get(k)).lower() in ("true", "yes", "y"))
+    return [{"label": "Checklist items completed", "value": f"{done} / {len(checklist)}"}]
+
+def _gdpr_stats(data) -> list[dict] | None:
+    if not isinstance(data, dict) or "legal_basis" not in data:
+        return None
+    return [
+        {"label": "Personal data collected?", "value": str(data.get("personal_data_collected") or "-")},
+        {"label": "Legal basis", "value": data.get("legal_basis") or "-"},
+        {"label": "DPA signed?", "value": str(data.get("dpa_signed") or "-")},
+    ]
+
 _STATS_BUILDERS = {
     "get_recommendations_coverage_summary": _coverage_stats,
     "get_pipeline_outlook": _outlook_stats,
@@ -1055,6 +1414,12 @@ _STATS_BUILDERS = {
     "get_employee_profile": _employee_profile_stats,
     "get_project_health_detail": _health_detail_stats,
     "get_project_info": _project_info_stats,
+    "get_project_sentiment": _sentiment_stats,
+    "get_cluster_governance_detail": _cluster_detail_stats,
+    "get_headcount_prediction": _headcount_prediction_stats,
+    "get_team_size_fit": _team_size_fit_stats,
+    "get_project_kickoff_status": _kickoff_stats,
+    "get_project_gdpr_status": _gdpr_stats,
 }
 
 def _build_stats(tool_name: str | None, data) -> list[dict] | None:
